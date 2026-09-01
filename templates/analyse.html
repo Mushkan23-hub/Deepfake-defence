@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Analyse — Deepfake Defence</title>
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+
+<header>
+  <div class="logo">🛡️ Deepfake Defence</div>
+  <nav>
+    <a href="/dashboard" class="nav-btn outline">← Dashboard</a>
+    <a href="/logout"    class="nav-btn outline">Logout</a>
+  </nav>
+</header>
+
+<main>
+
+  <!-- Upload Card -->
+  <section class="card">
+    <h2 class="section-title">Upload File for Analysis</h2>
+
+    <!-- Detection types explained -->
+    <div class="detection-tags">
+      <span class="dtag img">📷 Image Deepfake</span>
+      <span class="dtag img">😶 Face Morph</span>
+      <span class="dtag img">🔬 ELA Forensics</span>
+      <span class="dtag vid">🎬 Video Deepfake</span>
+      <span class="dtag vid">🎭 Face Swap</span>
+      <span class="dtag vid">📡 Stream Forensics</span>
+      <span class="dtag aud">🎙️ Voice Clone</span>
+      <span class="dtag aud">✂️ Audio Edit</span>
+      <span class="dtag aud">🗣️ Voice Morph</span>
+    </div>
+
+    <div id="drop-zone" class="drop-zone"
+         ondragover="event.preventDefault(); this.classList.add('drag-over')"
+         ondragleave="this.classList.remove('drag-over')"
+         ondrop="onDrop(event)"
+         onclick="document.getElementById('file-input').click()">
+      <div class="drop-icon">📂</div>
+      <p>Drag & drop or <span class="link">click to upload</span></p>
+      <p class="drop-sub">Images · Videos · Audio — all supported</p>
+      <p class="drop-formats">JPG PNG WEBP BMP · MP4 AVI MOV MKV · WAV MP3 FLAC OGG M4A</p>
+      <input type="file" id="file-input" hidden
+             accept=".jpg,.jpeg,.png,.webp,.bmp,.mp4,.avi,.mov,.mkv,.webm,.wav,.mp3,.flac,.ogg,.m4a"
+             onchange="onFileSelected(event)"/>
+    </div>
+
+    <div id="preview-wrap" class="preview-wrap hidden">
+      <img    id="preview-img" class="preview-media hidden" alt="preview"/>
+      <video  id="preview-vid" class="preview-media hidden" controls></video>
+      <div    id="preview-aud" class="preview-audio hidden">
+        <div class="audio-icon">🎙️</div>
+        <p id="audio-name"></p>
+        <audio id="audio-player" controls></audio>
+      </div>
+      <button class="btn-clear" onclick="clearFile()">✕ Remove</button>
+    </div>
+
+    <button class="btn-analyse" id="btn-analyse" onclick="analyse()" disabled>
+      🔍 Analyse File
+    </button>
+  </section>
+
+  <!-- Spinner -->
+  <div id="spinner" class="spinner hidden">
+    <div class="spin-ring"></div>
+    <p id="spin-text">Analysing…</p>
+    <p class="spin-sub">Running AI model + forensic tools</p>
+  </div>
+
+  <!-- ── RESULTS ── -->
+  <section id="result-card" class="card result-card hidden">
+
+    <!-- Verdict -->
+    <div id="verdict-banner" class="verdict-banner"></div>
+
+    <!-- Metrics -->
+    <div class="metrics" id="metrics-row"></div>
+
+    <!-- ── IMAGE RESULTS ── -->
+    <div id="image-results" class="hidden">
+
+      <div class="result-section">
+        <h3 class="result-h3">🤖 AI Signal Breakdown</h3>
+        <div class="bar-row"><span>Model Score</span><div class="bar-track"><div class="bar-fill" id="bar-model"></div></div><span id="lbl-model"></span></div>
+        <div class="bar-row"><span>Noise Pattern</span><div class="bar-track"><div class="bar-fill" id="bar-noise"></div></div><span id="lbl-noise"></span></div>
+        <div class="bar-row"><span>Face Asymmetry</span><div class="bar-track"><div class="bar-fill" id="bar-face"></div></div><span id="lbl-face"></span></div>
+        <div class="bar-row"><span>Compression</span><div class="bar-track"><div class="bar-fill" id="bar-compress"></div></div><span id="lbl-compress"></span></div>
+      </div>
+
+      <div class="result-section" id="face-morph-section">
+        <h3 class="result-h3">😶 Face Morph Detection</h3>
+        <div id="face-morph-content"></div>
+      </div>
+
+      <div class="result-section">
+        <h3 class="result-h3">🔬 Error Level Analysis (ELA)</h3>
+        <div id="ela-flags" class="flag-list"></div>
+        <div class="ela-grid" id="ela-stats"></div>
+      </div>
+
+    </div>
+
+    <!-- ── VIDEO RESULTS ── -->
+    <div id="video-results" class="hidden">
+
+      <div class="result-section">
+        <h3 class="result-h3">🎬 Frame-by-Frame Timeline</h3>
+        <div id="timeline" class="timeline"></div>
+        <div class="timeline-legend">
+          <span class="dot real"></span> Real &nbsp;
+          <span class="dot fake"></span> Deepfake
+        </div>
+      </div>
+
+      <div class="result-section" id="face-swap-section">
+        <h3 class="result-h3">🎭 Face Swap / Morph Detection</h3>
+        <div id="face-swap-content"></div>
+      </div>
+
+    </div>
+
+    <!-- ── AUDIO RESULTS ── -->
+    <div id="audio-results" class="hidden">
+
+      <div class="result-section">
+        <h3 class="result-h3">🎙️ Voice Clone Score</h3>
+        <div class="bar-row"><span>Clone Likelihood</span><div class="bar-track"><div class="bar-fill" id="bar-clone"></div></div><span id="lbl-clone"></span></div>
+        <div class="bar-row"><span>Edit/Splice Score</span><div class="bar-track"><div class="bar-fill" id="bar-edit"></div></div><span id="lbl-edit"></span></div>
+      </div>
+
+      <div class="result-section" id="voice-morph-section">
+        <h3 class="result-h3">🗣️ Voice Morph Detection</h3>
+        <div id="voice-morph-content"></div>
+      </div>
+
+      <div class="result-section">
+        <h3 class="result-h3">📊 Audio Forensics</h3>
+        <div id="audio-forensics-content"></div>
+      </div>
+
+    </div>
+
+    <!-- ── SHARED: EXIF + EXPLANATION ── -->
+    <div class="result-section">
+      <h3 class="result-h3">🤖 Detection Explanation</h3>
+      <ul id="explanation-list" class="explanation-list"></ul>
+    </div>
+
+    <div class="result-section" id="exif-section">
+      <h3 class="result-h3">📋 Metadata Forensics (ExifTool)</h3>
+      <div id="exif-flags" class="flag-list"></div>
+      <table class="meta-table" id="exif-table"></table>
+    </div>
+
+    <div class="result-section hidden" id="ffprobe-section">
+      <h3 class="result-h3">🎞️ Video Stream Forensics (ffprobe)</h3>
+      <div id="ffprobe-flags" class="flag-list"></div>
+      <div id="ffprobe-content"></div>
+    </div>
+
+  </section>
+</main>
+
+<script>
+let selectedFile = null;
+
+// ── File handling ──────────────────────────────────────────────
+function onDrop(e) {
+  e.preventDefault();
+  document.getElementById('drop-zone').classList.remove('drag-over');
+  if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+}
+function onFileSelected(e) { if (e.target.files[0]) loadFile(e.target.files[0]); }
+
+function loadFile(file) {
+  selectedFile = file;
+  document.getElementById('drop-zone').style.display = 'none';
+  document.getElementById('preview-wrap').classList.remove('hidden');
+  document.getElementById('result-card').classList.add('hidden');
+
+  const url  = URL.createObjectURL(file);
+  const type = file.type;
+
+  document.getElementById('preview-img').classList.add('hidden');
+  document.getElementById('preview-vid').classList.add('hidden');
+  document.getElementById('preview-aud').classList.add('hidden');
+
+  if (type.startsWith('image/')) {
+    const img = document.getElementById('preview-img');
+    img.src = url; img.classList.remove('hidden');
+  } else if (type.startsWith('video/')) {
+    const vid = document.getElementById('preview-vid');
+    vid.src = url; vid.classList.remove('hidden');
+  } else {
+    document.getElementById('audio-name').textContent = file.name;
+    document.getElementById('audio-player').src = url;
+    document.getElementById('preview-aud').classList.remove('hidden');
+  }
+  document.getElementById('btn-analyse').disabled = false;
+}
+
+function clearFile() {
+  selectedFile = null;
+  document.getElementById('preview-wrap').classList.add('hidden');
+  document.getElementById('drop-zone').style.display = '';
+  document.getElementById('btn-analyse').disabled = true;
+  document.getElementById('file-input').value = '';
+  document.getElementById('result-card').classList.add('hidden');
+}
+
+// ── Submit ─────────────────────────────────────────────────────
+async function analyse() {
+  if (!selectedFile) return;
+  const t = selectedFile.type;
+  const label = t.startsWith('image/') ? 'Analysing image…'
+              : t.startsWith('video/') ? 'Analysing video frames… may take a moment'
+              : 'Analysing audio… running voice clone + edit detection';
+
+  document.getElementById('spin-text').textContent = label;
+  document.getElementById('spinner').classList.remove('hidden');
+  document.getElementById('result-card').classList.add('hidden');
+
+  const form = new FormData();
+  form.append('file', selectedFile);
+
+  try {
+    const res  = await fetch('/api/analyse', { method: 'POST', body: form });
+    const data = await res.json();
+    document.getElementById('spinner').classList.add('hidden');
+    if (data.error) { alert('Error: ' + data.error); return; }
+    renderResult(data);
+  } catch(e) {
+    document.getElementById('spinner').classList.add('hidden');
+    alert('Request failed: ' + e.message);
+  }
+}
+
+// ── Render ─────────────────────────────────────────────────────
+function renderResult(d) {
+  const card = document.getElementById('result-card');
+  card.classList.remove('hidden');
+
+  // Verdict banner
+  const banner = document.getElementById('verdict-banner');
+  banner.textContent = d.is_fake ? '⚠️ DEEPFAKE / MANIPULATION DETECTED' : '✅ AUTHENTIC — No Manipulation Found';
+  banner.className   = 'verdict-banner ' + (d.is_fake ? 'fake' : 'real');
+
+  // Hide all type-specific sections first
+  ['image-results','video-results','audio-results'].forEach(id =>
+    document.getElementById(id).classList.add('hidden'));
+  document.getElementById('ffprobe-section').classList.add('hidden');
+
+  // Metrics
+  buildMetrics(d);
+
+  // Explanation
+  renderList('explanation-list', d.explanation || []);
+
+  // ExifTool
+  renderExif(d.forensics?.exif);
+
+  // Type-specific
+  if (d.file_type === 'image') {
+    document.getElementById('image-results').classList.remove('hidden');
+    setBar('model',    d.scores?.model    || 0);
+    setBar('noise',    d.scores?.noise    || 0);
+    setBar('face',     d.scores?.face     || 0);
+    setBar('compress', d.scores?.compression || 0);
+    renderFaceMorph(d);
+    renderELA(d.forensics?.ela);
+
+  } else if (d.file_type === 'video') {
+    document.getElementById('video-results').classList.remove('hidden');
+    renderTimeline(d.frame_results || []);
+    renderFaceSwap(d);
+    document.getElementById('ffprobe-section').classList.remove('hidden');
+    renderFfprobe(d.forensics?.ffprobe);
+
+  } else if (d.file_type === 'audio') {
+    document.getElementById('audio-results').classList.remove('hidden');
+    const s = d.scores || {};
+    setBar('clone', s.voice_clone || 0);
+    setBar('edit',  s.audio_edit  || 0);
+    renderVoiceMorph(d);
+    renderAudioForensics(d.forensics?.audio);
+  }
+
+  card.scrollIntoView({ behavior: 'smooth' });
+}
+
+function buildMetrics(d) {
+  const row = document.getElementById('metrics-row');
+  const items = [
+    { label: 'Confidence', value: d.confidence + '%' },
+    { label: 'Verdict',    value: d.verdict },
+  ];
+  if (d.file_type === 'video') {
+    items.push({ label: 'Fake Frames', value: (d.fake_ratio || 0) + '%' });
+    items.push({ label: 'Duration',    value: (d.duration_s || '—') + 's' });
+    items.push({ label: 'Frames Checked', value: (d.analysed || '—') });
+  }
+  if (d.file_type === 'audio') {
+    const af = d.forensics?.audio || {};
+    items.push({ label: 'Duration',     value: (af.duration_seconds || '—') + 's' });
+    items.push({ label: 'Clone Score',  value: (af.clone_score || '—') + '%' });
+    items.push({ label: 'Edit Score',   value: (af.edit_score  || '—') + '%' });
+  }
+  row.innerHTML = items.map(i =>
+    `<div class="metric-box">
+       <span class="metric-label">${i.label}</span>
+       <span class="metric-val">${i.value}</span>
+     </div>`).join('');
+}
+
+// Face Morph Detection results (image)
+function renderFaceMorph(d) {
+  const scores = d.scores || {};
+  const faceScore = scores.face || 0;
+  const morphScore = scores.model || 0;
+  const combined = (faceScore + morphScore) / 2;
+  const isMorphed = combined > 0.45;
+
+  const el = document.getElementById('face-morph-content');
+  el.innerHTML = `
+    <div class="morph-verdict ${isMorphed ? 'fake' : 'real'}">
+      ${isMorphed ? '⚠️ Possible face morph/swap detected' : '✅ No face morphing detected'}
+    </div>
+    <div class="morph-details">
+      <div class="morph-row">
+        <span>Face Symmetry Score</span>
+        <div class="bar-track"><div class="bar-fill" style="width:${Math.round(faceScore*100)}%;background:${faceScore>0.5?'#e53935':'#43a047'}"></div></div>
+        <span>${Math.round(faceScore*100)}%</span>
+      </div>
+      <div class="morph-row">
+        <span>Visual Manipulation Score</span>
+        <div class="bar-track"><div class="bar-fill" style="width:${Math.round(morphScore*100)}%;background:${morphScore>0.5?'#e53935':'#43a047'}"></div></div>
+        <span>${Math.round(morphScore*100)}%</span>
+      </div>
+    </div>
+    <ul class="flag-list" style="margin-top:10px">
+      ${isMorphed
+        ? '<li class="flag">🔴 Facial geometry shows asymmetries consistent with morph attack or face-swap.</li><li class="flag">🔴 AI model detected visual features associated with synthetic facial generation.</li>'
+        : '<li class="flag">🟢 Facial symmetry and visual features consistent with authentic photograph.</li>'
+      }
+    </ul>`;
+}
+
+// Face Swap (video)
+function renderFaceSwap(d) {
+  const fakeRatio = d.fake_ratio || 0;
+  const isFaceSwap = fakeRatio > 30;
+  const el = document.getElementById('face-swap-content');
+  el.innerHTML = `
+    <div class="morph-verdict ${isFaceSwap ? 'fake' : 'real'}">
+      ${isFaceSwap ? `⚠️ Face swap indicators found in ${fakeRatio}% of frames` : '✅ No face swap detected across frames'}
+    </div>
+    <ul class="flag-list" style="margin-top:10px">
+      ${isFaceSwap
+        ? `<li class="flag">🔴 ${fakeRatio}% of sampled frames show deepfake face-swap signatures.</li>
+           <li class="flag">🔴 Inconsistent facial textures across frames — classic face-swap artefact.</li>
+           <li class="flag">🔴 Temporal inconsistency in facial landmarks detected.</li>`
+        : '<li class="flag">🟢 Facial features remain consistent across all sampled frames.</li><li class="flag">🟢 No temporal inconsistencies indicating face-swap found.</li>'
+      }
+    </ul>`;
+}
+
+// Voice Morph (audio)
+function renderVoiceMorph(d) {
+  const scores    = d.scores || {};
+  const cloneScore = scores.voice_clone || 0;
+  const editScore  = scores.audio_edit  || 0;
+  const morphScore = (cloneScore + editScore) / 2;
+  const isMorphed  = morphScore > 0.4;
+
+  const el = document.getElementById('voice-morph-content');
+  el.innerHTML = `
+    <div class="morph-verdict ${isMorphed ? 'fake' : 'real'}">
+      ${isMorphed ? '⚠️ Voice morphing / cloning indicators detected' : '✅ No voice morphing detected'}
+    </div>
+    <div class="morph-details">
+      <div class="morph-row">
+        <span>Clone Likelihood</span>
+        <div class="bar-track"><div class="bar-fill" style="width:${Math.round(cloneScore*100)}%;background:${cloneScore>0.45?'#e53935':'#43a047'}"></div></div>
+        <span>${Math.round(cloneScore*100)}%</span>
+      </div>
+      <div class="morph-row">
+        <span>Edit/Splice Score</span>
+        <div class="bar-track"><div class="bar-fill" style="width:${Math.round(editScore*100)}%;background:${editScore>0.45?'#e53935':'#43a047'}"></div></div>
+        <span>${Math.round(editScore*100)}%</span>
+      </div>
+    </div>
+    <ul class="flag-list" style="margin-top:10px">
+      ${isMorphed
+        ? '<li class="flag">🔴 MFCC and pitch features inconsistent with natural human voice.</li><li class="flag">🔴 Possible voice conversion or neural TTS (Text-to-Speech) synthesis detected.</li>'
+        : '<li class="flag">🟢 Voice spectral features consistent with natural human speech.</li><li class="flag">🟢 No voice cloning or morphing signatures found.</li>'
+      }
+    </ul>`;
+}
+
+// Audio forensics table
+function renderAudioForensics(af) {
+  if (!af) return;
+  const features = af.voice_features || {};
+  const el = document.getElementById('audio-forensics-content');
+  const rows = [
+    ['Duration',        af.duration_seconds + 's'],
+    ['Sample Rate',     af.sample_rate + ' Hz'],
+    ['MFCC Variance',   features.mfcc_variance],
+    ['ZCR Variance',    features.zcr_variance],
+    ['Pitch Mean',      features.pitch_mean_hz + ' Hz'],
+    ['Pitch Variance',  features.pitch_variance],
+    ['Jitter',          features.jitter],
+    ['Shimmer',         features.shimmer],
+    ['Mel Kurtosis',    features.mel_kurtosis],
+    ['Edit Points',     (af.edit_points_sec || []).map(t => t+'s').join(', ') || 'None'],
+  ];
+  el.innerHTML = `<table class="meta-table">
+    ${rows.map(([k,v]) => `<tr><td class="meta-key">${k}</td><td>${v ?? '—'}</td></tr>`).join('')}
+  </table>`;
+}
+
+// Timeline dots
+function renderTimeline(frames) {
+  const tl = document.getElementById('timeline');
+  tl.innerHTML = '';
+  frames.forEach(f => {
+    const dot = document.createElement('div');
+    dot.className = 'tl-dot ' + (f.verdict === 'DEEPFAKE' ? 'fake' : 'real');
+    dot.title = `${f.timestamp}s — ${f.verdict} (${f.confidence}%)`;
+    tl.appendChild(dot);
+  });
+}
+
+// ELA stats
+function renderELA(ela) {
+  if (!ela || ela.error) return;
+  document.getElementById('ela-flags').innerHTML =
+    (ela.flags||[]).map(f => `<div class="flag">${f}</div>`).join('');
+  document.getElementById('ela-stats').innerHTML = `
+    <div class="ela-box"><span>Mean Error</span><strong>${ela.mean_error}</strong></div>
+    <div class="ela-box"><span>Max Error</span><strong>${ela.max_error}</strong></div>
+    <div class="ela-box"><span>Std Dev</span><strong>${ela.std_error}</strong></div>
+    <div class="ela-box"><span>Suspicious</span><strong>${ela.suspicious ? '⚠️ Yes' : '✅ No'}</strong></div>`;
+}
+
+// ExifTool
+function renderExif(exif) {
+  if (!exif || exif.error) return;
+  document.getElementById('exif-flags').innerHTML =
+    (exif.flags||[]).map(f => `<div class="flag">${f}</div>`).join('');
+  const meta = exif.metadata || {};
+  document.getElementById('exif-table').innerHTML =
+    Object.entries(meta).map(([k,v]) =>
+      `<tr><td class="meta-key">${k}</td><td>${v}</td></tr>`).join('');
+}
+
+// ffprobe
+function renderFfprobe(ffp) {
+  if (!ffp || ffp.error) return;
+  document.getElementById('ffprobe-flags').innerHTML =
+    (ffp.flags||[]).map(f => `<div class="flag">${f}</div>`).join('');
+  const wrap = document.getElementById('ffprobe-content');
+  wrap.innerHTML = '';
+  ['format','video','audio'].forEach(sec => {
+    const data = ffp[sec];
+    if (!data || !Object.keys(data).length) return;
+    const labels = {format:'📦 Container', video:'🎬 Video Stream', audio:'🔊 Audio Stream'};
+    wrap.innerHTML += `<p class="ffp-subtitle">${labels[sec]}</p>
+      <table class="meta-table">${Object.entries(data).map(([k,v]) =>
+        `<tr><td class="meta-key">${k}</td><td>${v}</td></tr>`).join('')}</table>`;
+  });
+}
+
+// Shared helpers
+function setBar(id, val) {
+  const pct  = Math.round(val * 100);
+  const fill = document.getElementById('bar-' + id);
+  if (!fill) return;
+  fill.style.width      = pct + '%';
+  fill.style.background = pct > 50 ? '#e53935' : '#43a047';
+  const lbl = document.getElementById('lbl-' + id);
+  if (lbl) lbl.textContent = pct + '%';
+}
+
+function renderList(id, lines) {
+  const ul = document.getElementById(id);
+  ul.innerHTML = '';
+  lines.forEach(l => {
+    const li = document.createElement('li');
+    li.textContent = l;
+    ul.appendChild(li);
+  });
+}
+</script>
+
+</body>
+</html>
