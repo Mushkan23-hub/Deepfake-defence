@@ -1,5 +1,14 @@
+# Secrets — the pattern is a glob on purpose. The original .gitignore listed
+# only ".env", which left ".env.txt" (same real credentials) trackable.
 .env
+.env.*
+!.env.example
+
 uploads/
+weights/
+*.pt
+*.pth
+
 __pycache__/
 *.pyc
 *.pyo

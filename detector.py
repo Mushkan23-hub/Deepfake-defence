@@ -5,6 +5,7 @@ Falls back to a heuristic analyser if model weights are unavailable.
 """
 
 import io
+import os
 import cv2
 import numpy as np
 from PIL import Image
@@ -44,9 +45,36 @@ class DeepfakeDetector(nn.Module):
         return self.classifier(features)
 
 
+WEIGHTS_PATH = os.getenv("DEEPFAKE_WEIGHTS", "weights/deepfake_effb4.pt")
+
+# IMPORTANT — read this before quoting any accuracy figure.
+#
+# timm gives us an ImageNet-pretrained *backbone*, but `self.classifier` above
+# is randomly initialised and has never seen a deepfake. Until it is trained,
+# its output is a fixed random projection of image features: deterministic, but
+# meaningless as a deepfake score. The original code described this as a "good
+# zero-shot proxy". It is not one, and presenting it as a detection confidence
+# would be a false claim in a forensic report.
+#
+# So: if trained weights exist at WEIGHTS_PATH we load them and use the model.
+# If they don't, we say so, and the verdict falls back to the heuristic signals
+# (noise / symmetry / compression) alone, which at least measure something real.
+
+MODEL_TRAINED = False
+
+
 def load_model():
-    """Load model. Uses pretrained ImageNet weights as base (good zero-shot proxy)."""
+    global MODEL_TRAINED
     model = DeepfakeDetector().to(DEVICE)
+    if os.path.isfile(WEIGHTS_PATH):
+        state = torch.load(WEIGHTS_PATH, map_location=DEVICE)
+        model.load_state_dict(state.get("state_dict", state))
+        MODEL_TRAINED = True
+        print(f"[detector] loaded fine-tuned weights from {WEIGHTS_PATH}")
+    else:
+        print(f"[detector] no weights at {WEIGHTS_PATH} — classifier head is "
+              "UNTRAINED. Falling back to heuristics only. Train the head "
+              "(e.g. on FaceForensics++ or Celeb-DF) before reporting accuracy.")
     model.eval()
     return model
 
@@ -143,9 +171,13 @@ def predict_image(pil_image: Image.Image) -> dict:
     face_s     = analyse_face_consistency(img_np)
     compress_s = analyse_compression_artifacts(img_np)
 
-    # Weighted fusion: model 60%, heuristics 40%
+    # Weighted fusion. The model only gets a vote once it has actually been
+    # trained; otherwise we would be averaging in noise and calling it evidence.
     heuristic = (noise_s * 0.4 + face_s * 0.35 + compress_s * 0.25)
-    fused = raw * 0.60 + heuristic * 0.40
+    if MODEL_TRAINED:
+        fused = raw * 0.60 + heuristic * 0.40
+    else:
+        fused = heuristic
     fused = float(np.clip(fused, 0, 1))
 
     is_fake = fused > 0.5
@@ -158,8 +190,9 @@ def predict_image(pil_image: Image.Image) -> dict:
         "confidence":  confidence_pct,
         "raw_score":   round(fused, 4),
         "is_fake":     is_fake,
+        "model_status": "trained" if MODEL_TRAINED else "untrained-baseline",
         "scores": {
-            "model":       round(raw, 4),
+            "model":       round(raw, 4) if MODEL_TRAINED else None,
             "noise":       noise_s,
             "face":        face_s,
             "compression": compress_s,

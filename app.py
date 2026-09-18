@@ -1,95 +1,549 @@
 """
-app.py — Deepfake Defence Flask backend
+app.py — Deepfake Defence / Digital Forensic Investigation Platform
+
 Run with:  python app.py
 Then open: http://127.0.0.1:5000
+
+What changed from the original app.py:
+  - It actually imports the modules that were sitting unused: database,
+    forensics, audio_detector, pdf_report.
+  - Login / signup / sessions exist, so the dashboard and scan history work.
+  - Uploads are kept (not deleted immediately) under a random name so a scan
+    can be re-run through Kali tools without re-uploading.
+  - Case management, evidence, and an audit timeline.
+  - Kali tool routes, all of which go through security.py first.
+  - debug=True is gone. It gives any visitor a Python shell on your machine.
 """
 
+import io
 import os
+import json
 import uuid
-from flask import Flask, request, jsonify, render_template
-from werkzeug.utils import secure_filename
-from PIL import Image
-from detector import predict_image, predict_video
+import zipfile
+from datetime import datetime, timezone
+from functools import wraps
 
-# ── Config ────────────────────────────────────────────────────────────────────
-UPLOAD_FOLDER  = "uploads"
-ALLOWED_IMAGE  = {"png", "jpg", "jpeg", "webp", "bmp"}
-ALLOWED_VIDEO  = {"mp4", "avi", "mov", "mkv", "webm"}
-MAX_CONTENT_MB = 100
+import bcrypt
+from dotenv import load_dotenv
+from flask import (Flask, request, jsonify, render_template, redirect,
+                   session, url_for, flash, send_file, abort)
+from PIL import Image
+
+import database as db
+import kali_client
+from security import (ValidationError, ALLOWED_IMAGE, ALLOWED_VIDEO,
+                      ALLOWED_AUDIO, ALLOWED_FORENSIC, MAX_UPLOAD_MB,
+                      check_extension, safe_stored_path)
+from detector import predict_image, predict_video
+from audio_detector import predict_audio
+from forensics import run_exiftool, run_ela, run_ffprobe
+from pdf_report import generate_report
+
+load_dotenv()
+
+UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
 
 app = Flask(__name__)
-app.config["UPLOAD_FOLDER"]    = UPLOAD_FOLDER
-app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_MB * 1024 * 1024
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+app.secret_key = os.getenv("SECRET_KEY")
+
+if not app.secret_key:
+    raise SystemExit(
+        "SECRET_KEY is not set. Create a .env file with:\n"
+        "  SECRET_KEY=<run: python -c \"import secrets;print(secrets.token_hex(32))\">"
+    )
+
+# Session cookie hardening. SECURE stays off for local http:// development;
+# set COOKIE_SECURE=1 in .env once you deploy behind HTTPS.
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.getenv("COOKIE_SECURE", "0") == "1",
+)
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def allowed(filename, allowed_set):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in allowed_set
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def login_required(view):
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if "user_id" not in session:
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Not signed in."}), 401
+            return redirect(url_for("index"))
+        return view(*args, **kwargs)
+    return wrapper
 
 
-def save_file(file):
-    ext      = file.filename.rsplit(".", 1)[1].lower()
-    name     = f"{uuid.uuid4().hex}.{ext}"
-    path     = os.path.join(app.config["UPLOAD_FOLDER"], name)
-    file.save(path)
-    return path
+def save_upload(file_storage, allowed_set):
+    """Store under a random name. The user's filename is never used as a path."""
+    ext = check_extension(file_storage.filename or "", allowed_set)
+    stored = f"{uuid.uuid4().hex}.{ext}"
+    path = os.path.join(UPLOAD_FOLDER, stored)
+    file_storage.save(path)
+    return stored, path
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+def current_case_id():
+    """Optional case to attach results to. Absent = ad-hoc scan."""
+    case_id = request.form.get("case_id") or (request.get_json(silent=True) or {}).get("case_id")
+    if not case_id:
+        return None
+    if not db.get_case(case_id, session["user_id"]):
+        raise ValidationError("Case not found.")
+    return case_id
+
+
+def require_authorised_case(case_id):
+    """
+    Gate for anything that reaches out to a third party. A case must exist and
+    carry an authorisation record before nmap / sherlock / theHarvester runs.
+    """
+    if not case_id:
+        raise ValidationError(
+            "Select a case first. Tools that contact external systems must be "
+            "attached to a case with a recorded authorisation."
+        )
+    case = db.get_case(case_id, session["user_id"])
+    if not case:
+        raise ValidationError("Case not found.")
+    if not case.get("authorisation"):
+        raise ValidationError(
+            "This case has no authorisation record. Add one (authority, "
+            "reference, scope) before running external tools."
+        )
+    return case
+
+
+@app.errorhandler(ValidationError)
+def handle_validation(exc):
+    return jsonify({"error": str(exc)}), 400
+
+
+@app.errorhandler(413)
+def handle_too_large(_):
+    return jsonify({"error": f"File is larger than {MAX_UPLOAD_MB} MB."}), 413
+
+
+# ── Auth ─────────────────────────────────────────────────────────────────────
+
 @app.route("/")
 def index():
-    return render_template("index.html")
+    if "user_id" in session:
+        return redirect(url_for("dashboard"))
+    return render_template("index.html", mode="login")
 
 
-@app.route("/analyse/image", methods=["POST"])
+@app.route("/signup", methods=["GET"])
+def signup_page():
+    return render_template("index.html", mode="signup")
+
+
+@app.route("/signup", methods=["POST"])
+def signup():
+    username = (request.form.get("username") or "").strip()
+    email = (request.form.get("email") or "").strip().lower()
+    password = request.form.get("password") or ""
+
+    if not (3 <= len(username) <= 32):
+        flash("Username must be 3-32 characters.", "error")
+        return redirect(url_for("signup_page"))
+    if "@" not in email or len(email) < 5:
+        flash("Enter a valid email address.", "error")
+        return redirect(url_for("signup_page"))
+    if len(password) < 8:
+        flash("Password must be at least 8 characters.", "error")
+        return redirect(url_for("signup_page"))
+
+    pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    user_id, err = db.create_user(username, email, pw_hash)
+    if err:
+        flash(err, "error")
+        return redirect(url_for("signup_page"))
+
+    session.clear()
+    session["user_id"] = user_id
+    session["username"] = username
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    email = (request.form.get("email") or "").strip().lower()
+    password = request.form.get("password") or ""
+    user = db.get_user_by_email(email)
+
+    # Same message either way, so the form can't be used to enumerate accounts.
+    if not user or not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
+        flash("Incorrect email or password.", "error")
+        return redirect(url_for("index"))
+
+    session.clear()
+    session["user_id"] = str(user["_id"])
+    session["username"] = user["username"]
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("index"))
+
+
+# ── Pages ────────────────────────────────────────────────────────────────────
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    user_id = session["user_id"]
+    return render_template(
+        "dashboard.html",
+        username=session.get("username", "investigator"),
+        stats=db.get_scan_stats(user_id),
+        timeline=db.get_scan_timeline(user_id),
+        scans=db.get_user_scans(user_id),
+    )
+
+
+@app.route("/analyse")
+@login_required
+def analyse_page():
+    return render_template("analyse.html",
+                           username=session.get("username", "investigator"),
+                           cases=db.get_cases(session["user_id"]),
+                           kali_online=kali_client.is_online())
+
+
+# ── Detection API ────────────────────────────────────────────────────────────
+
+@app.route("/api/analyse/image", methods=["POST"])
+@login_required
 def analyse_image():
-    if "file" not in request.files:
-        return jsonify({"error": "No file provided."}), 400
+    if "file" not in request.files or not request.files["file"].filename:
+        raise ValidationError("No file provided.")
+    case_id = current_case_id()
+    stored, path = save_upload(request.files["file"], ALLOWED_IMAGE)
 
-    file = request.files["file"]
-    if not file.filename:
-        return jsonify({"error": "Empty filename."}), 400
-    if not allowed(file.filename, ALLOWED_IMAGE):
-        return jsonify({"error": f"Unsupported format. Allowed: {ALLOWED_IMAGE}"}), 400
-
-    path = save_file(file)
     try:
-        pil    = Image.open(path)
-        result = predict_image(pil)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        os.remove(path)
+        result = predict_image(Image.open(path))
+        result["forensics"] = {
+            "exiftool": run_exiftool(path),
+            "ela": run_ela(path),
+        }
+        result["stored_name"] = stored
+        result["hashes"] = kali_client.compute_hashes(path, stored).get("hashes", {})
+        scan_id = db.save_scan(session["user_id"], request.files["file"].filename,
+                               "image", result, case_id)
+        result["scan_id"] = scan_id
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": f"Analysis failed: {exc}"}), 500
 
-    return jsonify(result)
 
-
-@app.route("/analyse/video", methods=["POST"])
+@app.route("/api/analyse/video", methods=["POST"])
+@login_required
 def analyse_video():
-    if "file" not in request.files:
-        return jsonify({"error": "No file provided."}), 400
+    if "file" not in request.files or not request.files["file"].filename:
+        raise ValidationError("No file provided.")
+    case_id = current_case_id()
+    stored, path = save_upload(request.files["file"], ALLOWED_VIDEO)
 
-    file = request.files["file"]
-    if not file.filename:
-        return jsonify({"error": "Empty filename."}), 400
-    if not allowed(file.filename, ALLOWED_VIDEO):
-        return jsonify({"error": f"Unsupported format. Allowed: {ALLOWED_VIDEO}"}), 400
-
-    path = save_file(file)
     try:
         result = predict_video(path, sample_every=15)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
+        if "error" in result:
+            return jsonify(result), 400
+        result["forensics"] = {
+            "exiftool": run_exiftool(path),
+            "ffprobe": run_ffprobe(path),
+        }
+        result["stored_name"] = stored
+        result["hashes"] = kali_client.compute_hashes(path, stored).get("hashes", {})
+        result["scan_id"] = db.save_scan(session["user_id"],
+                                         request.files["file"].filename,
+                                         "video", result, case_id)
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": f"Analysis failed: {exc}"}), 500
 
+
+@app.route("/api/analyse/audio", methods=["POST"])
+@login_required
+def analyse_audio():
+    if "file" not in request.files or not request.files["file"].filename:
+        raise ValidationError("No file provided.")
+    case_id = current_case_id()
+    stored, path = save_upload(request.files["file"], ALLOWED_AUDIO)
+
+    try:
+        result = predict_audio(path)
+        if "error" in result:
+            return jsonify(result), 400
+        result["forensics"] = {"exiftool": run_exiftool(path)}
+        result["stored_name"] = stored
+        result["hashes"] = kali_client.compute_hashes(path, stored).get("hashes", {})
+        result["scan_id"] = db.save_scan(session["user_id"],
+                                         request.files["file"].filename,
+                                         "audio", result, case_id)
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": f"Analysis failed: {exc}"}), 500
+
+
+@app.route("/api/scan/<scan_id>")
+@login_required
+def get_scan(scan_id):
+    scan = db.get_scan_by_id(scan_id, session["user_id"])
+    if not scan:
+        return jsonify({"error": "Scan not found."}), 404
+    scan["timestamp"] = scan["timestamp"].isoformat()
+    return jsonify(scan)
+
+
+@app.route("/report/<scan_id>")
+@login_required
+def report(scan_id):
+    scan = db.get_scan_by_id(scan_id, session["user_id"])
+    if not scan:
+        abort(404)
+    pdf = generate_report(scan, session.get("username", "investigator"))
+    return send_file(io.BytesIO(pdf), mimetype="application/pdf",
+                     as_attachment=True,
+                     download_name=f"forensic-report-{scan_id}.pdf")
+
+
+# ── Case management ──────────────────────────────────────────────────────────
+
+@app.route("/api/cases", methods=["GET"])
+@login_required
+def list_cases():
+    cases = db.get_cases(session["user_id"])
+    for c in cases:
+        c["created_at"] = c["created_at"].isoformat()
+        c["updated_at"] = c["updated_at"].isoformat()
+        if c.get("authorisation"):
+            c["authorisation"]["recorded_at"] = c["authorisation"]["recorded_at"].isoformat()
+    return jsonify(cases)
+
+
+@app.route("/api/cases", methods=["POST"])
+@login_required
+def new_case():
+    body = request.get_json(silent=True) or request.form
+    title = (body.get("title") or "").strip()
+    if not (3 <= len(title) <= 120):
+        raise ValidationError("Case title must be 3-120 characters.")
+    case_id = db.create_case(session["user_id"], title,
+                             body.get("description") or "")
+    return jsonify({"case_id": case_id}), 201
+
+
+@app.route("/api/cases/<case_id>")
+@login_required
+def case_detail(case_id):
+    case = db.get_case(case_id, session["user_id"])
+    if not case:
+        return jsonify({"error": "Case not found."}), 404
+    case["created_at"] = case["created_at"].isoformat()
+    case["updated_at"] = case["updated_at"].isoformat()
+    if case.get("authorisation"):
+        case["authorisation"]["recorded_at"] = case["authorisation"]["recorded_at"].isoformat()
+
+    scans = db.get_case_scans(case_id, session["user_id"])
+    for s in scans:
+        s["timestamp"] = s["timestamp"].isoformat()
+    evidence = db.get_case_evidence(case_id, session["user_id"])
+    for e in evidence:
+        e["created_at"] = e["created_at"].isoformat()
+
+    return jsonify({
+        "case": case,
+        "scans": scans,
+        "evidence": evidence,
+        "timeline": db.get_case_timeline(case_id, session["user_id"]),
+    })
+
+
+@app.route("/api/cases/<case_id>/authorisation", methods=["POST"])
+@login_required
+def set_authorisation(case_id):
+    if not db.get_case(case_id, session["user_id"]):
+        return jsonify({"error": "Case not found."}), 404
+    body = request.get_json(silent=True) or request.form
+    authority = (body.get("authority") or "").strip()
+    reference = (body.get("reference") or "").strip()
+    scope = (body.get("scope") or "").strip()
+    if not authority or not reference or not scope:
+        raise ValidationError(
+            "All three fields are required: who authorised this, the written "
+            "reference (letter/ticket/consent form), and what it covers."
+        )
+    record = db.set_case_authorisation(case_id, session["user_id"],
+                                       authority, reference, scope)
+    record["recorded_at"] = record["recorded_at"].isoformat()
+    return jsonify(record), 201
+
+
+@app.route("/api/cases/<case_id>/close", methods=["POST"])
+@login_required
+def close_case(case_id):
+    if not db.get_case(case_id, session["user_id"]):
+        return jsonify({"error": "Case not found."}), 404
+    db.close_case(case_id, session["user_id"])
+    return jsonify({"status": "closed"})
+
+
+# ── Kali integration ─────────────────────────────────────────────────────────
+
+@app.route("/api/kali/status")
+@login_required
+def kali_status():
+    online = kali_client.is_online()
+    return jsonify({
+        "online": online,
+        "agent_url": kali_client.AGENT_URL,
+        "tools": kali_client.available_tools() if online else {},
+        "file_tools": kali_client.FILE_TOOLS,
+    })
+
+
+@app.route("/api/kali/file/<tool>", methods=["POST"])
+@login_required
+def kali_file_tool(tool):
+    """
+    Run a file-based Kali tool. Two ways to supply the file:
+      - upload a new one as 'file'
+      - reference an already-stored upload by 'stored_name'
+    """
+    case_id = current_case_id()
+    cleanup = False
+
+    if "file" in request.files and request.files["file"].filename:
+        original = request.files["file"].filename
+        stored, path = save_upload(request.files["file"], ALLOWED_FORENSIC)
+        cleanup = False   # keep it; the case may need it again
+    else:
+        stored = (request.form.get("stored_name") or "").strip()
+        path = safe_stored_path(UPLOAD_FOLDER, stored)
+        original = stored
+
+    result = kali_client.run_file_tool(tool, path, original)
+    result["tool"] = tool
+
+    if case_id:
+        db.save_evidence(case_id, session["user_id"], tool, original, result)
     return jsonify(result)
 
 
-# ── Entry ─────────────────────────────────────────────────────────────────────
+@app.route("/api/kali/network/nmap", methods=["POST"])
+@login_required
+def kali_nmap():
+    body = request.get_json(silent=True) or request.form
+    case_id = current_case_id()
+    require_authorised_case(case_id)
+
+    target = body.get("target") or ""
+    ports = body.get("ports") or "1-1024"
+    result = kali_client.scan_network(target, ports)
+    db.save_evidence(case_id, session["user_id"], "nmap", target, result)
+    return jsonify(result)
+
+
+@app.route("/api/kali/osint/sherlock", methods=["POST"])
+@login_required
+def kali_sherlock():
+    body = request.get_json(silent=True) or request.form
+    case_id = current_case_id()
+    require_authorised_case(case_id)
+
+    username = body.get("username") or ""
+    result = kali_client.osint_username(username)
+    db.save_evidence(case_id, session["user_id"], "sherlock", username, result)
+    return jsonify(result)
+
+
+@app.route("/api/kali/osint/theharvester", methods=["POST"])
+@login_required
+def kali_theharvester():
+    body = request.get_json(silent=True) or request.form
+    case_id = current_case_id()
+    require_authorised_case(case_id)
+
+    domain = body.get("domain") or ""
+    result = kali_client.osint_domain(domain)
+    db.save_evidence(case_id, session["user_id"], "theHarvester", domain, result)
+    return jsonify(result)
+
+
+# ── Evidence export ──────────────────────────────────────────────────────────
+
+@app.route("/api/cases/<case_id>/export")
+@login_required
+def export_case(case_id):
+    """Package the whole case as a ZIP: JSON bundle, tool output, PDF reports."""
+    user_id = session["user_id"]
+    case = db.get_case(case_id, user_id)
+    if not case:
+        abort(404)
+
+    scans = db.get_case_scans(case_id, user_id)
+    evidence = db.get_case_evidence(case_id, user_id)
+    timeline = db.get_case_timeline(case_id, user_id)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        bundle = {
+            "case": case,
+            "scans": scans,
+            "evidence": evidence,
+            "timeline": timeline,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "exported_by": session.get("username"),
+        }
+        zf.writestr("case.json", json.dumps(bundle, default=str, indent=2))
+
+        lines = [f"CASE: {case['title']}", f"Status: {case['status']}", ""]
+        auth = case.get("authorisation")
+        lines.append("AUTHORISATION")
+        if auth:
+            lines += [f"  Authority: {auth['authority']}",
+                      f"  Reference: {auth['reference']}",
+                      f"  Scope:     {auth['scope']}", ""]
+        else:
+            lines += ["  None recorded. No external-facing tools were run.", ""]
+        lines.append("TIMELINE")
+        lines += [f"  {e['at']}  {e['action']:<22} {e['detail']}" for e in timeline]
+        zf.writestr("chain-of-custody.txt", "\n".join(lines))
+
+        for ev in evidence:
+            name = f"evidence/{ev['created_at']:%Y%m%d-%H%M%S}-{ev['tool']}.txt"
+            body = (f"Tool:    {ev['tool']}\nSubject: {ev['subject']}\n"
+                    f"Command: {ev['command']}\nOK:      {ev['ok']}\n"
+                    f"Hashes:  {json.dumps(ev.get('hashes', {}))}\n\n"
+                    f"--- stdout ---\n{ev['stdout']}\n\n--- stderr ---\n{ev['stderr']}\n")
+            zf.writestr(name, body)
+
+        for s in scans:
+            try:
+                pdf = generate_report(s, session.get("username", "investigator"))
+                zf.writestr(f"reports/scan-{s['_id']}.pdf", pdf)
+            except Exception as exc:
+                zf.writestr(f"reports/scan-{s['_id']}.ERROR.txt", str(exc))
+
+    buf.seek(0)
+    db.log_action(case_id, user_id, "case.exported", "Case exported as ZIP.")
+    safe_title = "".join(c if c.isalnum() else "-" for c in case["title"])[:40]
+    return send_file(buf, mimetype="application/zip", as_attachment=True,
+                     download_name=f"case-{safe_title}-{case_id}.zip")
+
+
+# ── Entry ────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    print("\n🛡️  Deepfake Defence — starting on http://127.0.0.1:5000\n")
-    app.run(debug=True, host="127.0.0.1", port=5000)
+    print("\n  Deepfake Defence — http://127.0.0.1:5000")
+    print(f"  Kali agent: {kali_client.AGENT_URL} "
+          f"({'online' if kali_client.is_online() else 'offline'})\n")
+    # debug=False deliberately: Werkzeug's debugger is a remote shell.
+    app.run(debug=False, host="127.0.0.1", port=5000)
