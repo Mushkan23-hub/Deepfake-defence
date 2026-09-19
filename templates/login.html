@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Login — Deepfake Defence{% endblock %}
+{% block content %}
+<div class="card auth-card">
+  <h2>Welcome back</h2>
+  <form method="POST" action="{{ url_for('login') }}">
+    <input type="hidden" name="next" value="{{ next }}">
+    <label for="email">Email</label>
+    <input type="email" id="email" name="email" required autofocus>
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" required>
+    <button type="submit" class="btn btn-primary" style="width:100%; margin-top:18px;">Login</button>
+  </form>
+  <div class="auth-switch">
+    Don't have an account? <a href="{{ url_for('signup_page') }}" style="color: var(--accent); font-weight:600;">Sign up</a>
+  </div>
+</div>
+{% endblock %}

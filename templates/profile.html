@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}My Profile — Deepfake Defence{% endblock %}
+{% block content %}
+
+<h1>My Profile</h1>
+
+<div class="grid grid-2">
+  <div class="card">
+    <div class="profile-avatar">{{ user.username[0]|upper }}</div>
+    <h3 style="text-align:center; margin:10px 0 2px;">{{ user.full_name or user.username }}</h3>
+    <p style="text-align:center; color:var(--text-muted); margin:0 0 20px;">@{{ user.username }}</p>
+
+    <div class="profile-row"><span>Email</span><strong>{{ user.email }}</strong></div>
+    <div class="profile-row"><span>Member since</span><strong>{{ user.created_at.strftime('%d %b %Y') if user.created_at else '—' }}</strong></div>
+    <div class="profile-row"><span>Total scans</span><strong>{{ stats.total }}</strong></div>
+    <div class="profile-row"><span>Deepfakes found</span><strong>{{ stats.fake }}</strong></div>
+  </div>
+
+  <div>
+    <div class="card">
+      <h3 style="margin-top:0;">Save your changes</h3>
+      <form method="POST" action="{{ url_for('update_profile') }}">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username" minlength="3" maxlength="32" value="{{ user.username }}" required>
+        <p style="font-size:0.78rem; color:var(--text-muted); margin:4px 0 0;">This is the name shown across the app — changing it changes your login handle too.</p>
+        <label for="full_name">Display name</label>
+        <input type="text" id="full_name" name="full_name" maxlength="80" value="{{ user.full_name or '' }}" placeholder="How your name appears on reports">
+        <label for="bio">Bio</label>
+        <textarea id="bio" name="bio" maxlength="400" placeholder="Optional — a line about yourself or your role">{{ user.bio or '' }}</textarea>
+        <button type="submit" class="btn btn-primary" style="margin-top:14px;">Save changes</button>
+      </form>
+    </div>
+
+    <div class="card" style="margin-top:20px; text-align:center;">
+      <p style="color:var(--text-muted); margin:0;">Need to change your password or check the Kali connection?</p>
+      <a class="btn btn-sm" style="margin-top:10px;" href="{{ url_for('settings_page') }}">Go to Settings →</a>
+    </div>
+  </div>
+</div>
+
+{% endblock %}

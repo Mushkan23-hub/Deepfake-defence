@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} — Deepfake Defence{% endblock %}
+{% block content %}
+
+<h1>{{ title }}</h1>
+<p class="tool-desc">{{ description }}</p>
+
+{% if not kali_online %}
+<div class="flash flash-error">
+  Kali VM is not reachable. Start the VM and run <code>agent.py</code>, then reload this page.
+</div>
+{% elif not tool_installed %}
+<div class="flash flash-error">
+  <code>{{ tool_binary }}</code> is not installed in the Kali VM. Run <code>sudo apt install {{ tool_binary }}</code> there.
+</div>
+{% endif %}
+
+<div class="card">
+  <label>Optional: attach to a case</label>
+  <select id="case-select">
+    <option value="">— No case (results won't be saved as evidence) —</option>
+    {% for c in cases %}
+      <option value="{{ c._id }}">{{ c.title }}</option>
+    {% endfor %}
+  </select>
+
+  <label>File</label>
+  <div class="dropzone" id="dropzone">
+    <p id="dz-label">Click to choose a file, or drag one here</p>
+    <input type="file" id="file-input">
+  </div>
+
+  <button class="btn btn-primary" id="run-btn" data-label="Run {{ title }}" style="margin-top:16px;"
+          {{ 'disabled' if not kali_online or not tool_installed }}
+          onclick="ddRunFileTool('{{ tool }}', {fileInput: document.getElementById('file-input'), caseSelect: document.getElementById('case-select'), button: this, resultEl: document.getElementById('result'), hashEl: document.getElementById('hashes'), artifactsEl: document.getElementById('artifacts')})">
+    Run {{ title }}
+  </button>
+</div>
+
+<div class="card" style="margin-top:20px;">
+  <h4 style="margin-top:0;">Output</h4>
+  <pre class="result" id="result">Run the tool to see output here.</pre>
+</div>
+
+<div class="card" style="margin-top:20px;">
+  <h4 style="margin-top:0;">File hashes</h4>
+  <div id="hashes" style="font-size:0.85rem; color: var(--text-muted);">—</div>
+</div>
+
+<div id="artifacts" style="margin-top:20px;"></div>
+
+{% endblock %}
+{% block scripts %}
+<script>
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('file-input');
+const dzLabel = document.getElementById('dz-label');
+dropzone.addEventListener('click', () => fileInput.click());
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
+dropzone.addEventListener('drop', e => {
+  e.preventDefault(); dropzone.classList.remove('drag');
+  if (e.dataTransfer.files.length) { fileInput.files = e.dataTransfer.files; dzLabel.innerHTML = '📄 ' + e.dataTransfer.files[0].name; }
+});
+fileInput.addEventListener('change', () => { if (fileInput.files[0]) dzLabel.innerHTML = '📄 ' + fileInput.files[0].name; });
+</script>
+{% endblock %}

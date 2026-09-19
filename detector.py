@@ -1,91 +1,95 @@
 """
 detector.py — Deepfake Defence core engine
-Uses a pretrained EfficientNet-B4 fine-tuned for deepfake detection via timm.
-Falls back to a heuristic analyser if model weights are unavailable.
+
+Uses a real, pretrained deepfake image classifier (ashish-001/deepfake-
+detection-using-ViT on Hugging Face — a ViT-Base fine-tuned on a labeled
+real/fake face dataset, apache-2.0 licensed, reports 92% test accuracy on its
+own dataset: https://huggingface.co/ashish-001/deepfake-detection-using-ViT).
+
+Caveat worth keeping in mind: it was trained on one specific Kaggle dataset of
+mostly face-swap-style fakes, so it will not generalise perfectly to every
+generator (diffusion-based images especially) — but it is a real trained
+classifier, unlike the randomly-initialised head this file used before.
+
+If `transformers` isn't installed, or the model can't be downloaded (first
+run needs internet access to huggingface.co), this falls back to heuristic
+signals only (noise / symmetry / compression) and says so in the result via
+`model_status`.
 """
 
-import io
 import os
 import cv2
 import numpy as np
 from PIL import Image
 import torch
-import torch.nn as nn
-import torchvision.transforms as transforms
-import timm
+
+try:
+    from transformers import AutoImageProcessor, AutoModelForImageClassification
+    _TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    _TRANSFORMERS_AVAILABLE = False
 
 # ── Constants ────────────────────────────────────────────────────────────────
-IMG_SIZE = 224
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-TRANSFORM = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225]),
-])
-
-# ── Model ─────────────────────────────────────────────────────────────────────
-class DeepfakeDetector(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # EfficientNet-B4 pretrained on ImageNet; final layer replaced for binary classification
-        self.backbone = timm.create_model("efficientnet_b4", pretrained=True, num_classes=0)
-        feat_dim = self.backbone.num_features
-        self.classifier = nn.Sequential(
-            nn.Linear(feat_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(256, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        features = self.backbone(x)
-        return self.classifier(features)
-
-
-WEIGHTS_PATH = os.getenv("DEEPFAKE_WEIGHTS", "weights/deepfake_effb4.pt")
-
-# IMPORTANT — read this before quoting any accuracy figure.
-#
-# timm gives us an ImageNet-pretrained *backbone*, but `self.classifier` above
-# is randomly initialised and has never seen a deepfake. Until it is trained,
-# its output is a fixed random projection of image features: deterministic, but
-# meaningless as a deepfake score. The original code described this as a "good
-# zero-shot proxy". It is not one, and presenting it as a detection confidence
-# would be a false claim in a forensic report.
-#
-# So: if trained weights exist at WEIGHTS_PATH we load them and use the model.
-# If they don't, we say so, and the verdict falls back to the heuristic signals
-# (noise / symmetry / compression) alone, which at least measure something real.
+HF_MODEL_ID = os.getenv("DEEPFAKE_HF_MODEL", "ashish-001/deepfake-detection-using-ViT")
 
 MODEL_TRAINED = False
+MODEL_LOAD_ERROR = None
+
+_processor = None
+_model = None
 
 
 def load_model():
-    global MODEL_TRAINED
-    model = DeepfakeDetector().to(DEVICE)
-    if os.path.isfile(WEIGHTS_PATH):
-        state = torch.load(WEIGHTS_PATH, map_location=DEVICE)
-        model.load_state_dict(state.get("state_dict", state))
+    """
+    Downloads and caches the Hugging Face model on first call (needs internet
+    the first time; cached under ~/.cache/huggingface after that). Never
+    raises — failures fall back to heuristics and are logged once.
+    """
+    global _processor, _model, MODEL_TRAINED, MODEL_LOAD_ERROR
+
+    if _model is not None or MODEL_LOAD_ERROR:
+        return
+
+    if not _TRANSFORMERS_AVAILABLE:
+        MODEL_LOAD_ERROR = "transformers is not installed"
+        print(f"[detector] {MODEL_LOAD_ERROR} — run: pip install transformers\n"
+              "[detector] Falling back to heuristics only.")
+        return
+
+    try:
+        _processor = AutoImageProcessor.from_pretrained(HF_MODEL_ID)
+        _model = AutoModelForImageClassification.from_pretrained(HF_MODEL_ID).to(DEVICE)
+        _model.eval()
         MODEL_TRAINED = True
-        print(f"[detector] loaded fine-tuned weights from {WEIGHTS_PATH}")
-    else:
-        print(f"[detector] no weights at {WEIGHTS_PATH} — classifier head is "
-              "UNTRAINED. Falling back to heuristics only. Train the head "
-              "(e.g. on FaceForensics++ or Celeb-DF) before reporting accuracy.")
-    model.eval()
-    return model
+        print(f"[detector] loaded pretrained classifier: {HF_MODEL_ID}")
+    except Exception as exc:
+        MODEL_LOAD_ERROR = str(exc)
+        print(f"[detector] could not load {HF_MODEL_ID}: {exc}\n"
+              "[detector] Falling back to heuristics only. If this is the "
+              "first run, check internet access — the model downloads from "
+              "huggingface.co.")
 
 
-_model = None
-
-def get_model():
-    global _model
+def _fake_probability(pil_image: Image.Image):
+    """
+    Runs the HF model and returns P(fake) in [0, 1], or None if the model
+    isn't loaded or its label scheme is unrecognised. Reads the model's own
+    id2label mapping rather than assuming index 0/1 order, since that varies
+    by checkpoint.
+    """
     if _model is None:
-        _model = load_model()
-    return _model
+        return None
+    inputs = _processor(images=pil_image.convert("RGB"), return_tensors="pt").to(DEVICE)
+    with torch.no_grad():
+        logits = _model(**inputs).logits
+        probs = torch.softmax(logits, dim=-1)[0]
+
+    id2label = {int(k): str(v).lower() for k, v in _model.config.id2label.items()}
+    fake_idx = next((i for i, lbl in id2label.items() if "fake" in lbl), None)
+    if fake_idx is None:
+        return None  # Unrecognised label scheme — don't guess which index means what.
+    return float(probs[fake_idx].item())
 
 
 # ── Heuristic helpers (used for explanation layer) ────────────────────────────
@@ -158,26 +162,26 @@ def predict_image(pil_image: Image.Image) -> dict:
     Run deepfake detection on a PIL image.
     Returns dict with verdict, confidence, scores, and explanation.
     """
-    model = get_model()
+    load_model()
     img_np = np.array(pil_image.convert("RGB"))
 
-    # Model inference
-    tensor = TRANSFORM(pil_image.convert("RGB")).unsqueeze(0).to(DEVICE)
-    with torch.no_grad():
-        raw = model(tensor).item()
+    fake_prob = _fake_probability(pil_image)
 
-    # Heuristic scores
+    # Heuristic scores — always computed, used either as the sole signal
+    # (model unavailable) or as a smaller supporting weight (model loaded).
     noise_s    = analyse_noise(img_np)
     face_s     = analyse_face_consistency(img_np)
     compress_s = analyse_compression_artifacts(img_np)
+    heuristic  = (noise_s * 0.4 + face_s * 0.35 + compress_s * 0.25)
 
-    # Weighted fusion. The model only gets a vote once it has actually been
-    # trained; otherwise we would be averaging in noise and calling it evidence.
-    heuristic = (noise_s * 0.4 + face_s * 0.35 + compress_s * 0.25)
-    if MODEL_TRAINED:
-        fused = raw * 0.60 + heuristic * 0.40
+    if fake_prob is not None:
+        # Real, trained classifier does most of the work; heuristics add a
+        # small amount of independent signal rather than overriding it.
+        fused = fake_prob * 0.85 + heuristic * 0.15
+        model_status = "trained"
     else:
         fused = heuristic
+        model_status = "untrained-baseline"
     fused = float(np.clip(fused, 0, 1))
 
     is_fake = fused > 0.5
@@ -190,9 +194,10 @@ def predict_image(pil_image: Image.Image) -> dict:
         "confidence":  confidence_pct,
         "raw_score":   round(fused, 4),
         "is_fake":     is_fake,
-        "model_status": "trained" if MODEL_TRAINED else "untrained-baseline",
+        "model_status": model_status,
+        "model_source": HF_MODEL_ID if model_status == "trained" else None,
         "scores": {
-            "model":       round(raw, 4) if MODEL_TRAINED else None,
+            "model":       round(fake_prob, 4) if fake_prob is not None else None,
             "noise":       noise_s,
             "face":        face_s,
             "compression": compress_s,

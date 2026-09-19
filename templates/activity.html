@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}My Activity — Deepfake Defence{% endblock %}
+{% block content %}
+
+<h1>My Activity</h1>
+
+<div class="grid grid-stats" style="margin-bottom:20px;">
+  <div class="card stat-card"><div class="num">{{ stats.total }}</div><div class="label">Total Scans</div></div>
+  <div class="card stat-card" style="border-color: var(--danger);"><div class="num">{{ stats.fake }}</div><div class="label">Deepfakes Found</div></div>
+  <div class="card stat-card" style="border-color: var(--success);"><div class="num">{{ stats.real }}</div><div class="label">Authentic Files</div></div>
+  <div class="card stat-card" style="border-color: var(--accent-3, var(--accent));"><div class="num">{{ stats.by_type.image }}</div><div class="label">Images</div></div>
+  <div class="card stat-card" style="border-color: var(--accent-2);"><div class="num">{{ stats.by_type.video }}</div><div class="label">Videos</div></div>
+  <div class="card stat-card"><div class="num">{{ stats.by_type.audio }}</div><div class="label">Audio Files</div></div>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0;">All scans</h3>
+  {% if scans %}
+  <table>
+    <tr><th>File</th><th>Type</th><th>Verdict</th><th>Confidence</th><th>When</th><th></th></tr>
+    {% for s in scans %}
+    <tr>
+      <td>{{ s.filename }}</td>
+      <td>{{ s.file_type }}</td>
+      <td><span class="badge {{ 'badge-fake' if s.is_fake else 'badge-real' }}">{{ s.verdict }}</span></td>
+      <td>{{ s.confidence }}%</td>
+      <td>{{ s.timestamp }}</td>
+      <td><a class="btn btn-sm" href="{{ url_for('report', scan_id=s._id) }}">PDF report</a></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p style="color: var(--text-muted);">No scans yet.</p>
+  {% endif %}
+</div>
+
+{% endblock %}

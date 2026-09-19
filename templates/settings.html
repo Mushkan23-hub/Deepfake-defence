@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Settings — Deepfake Defence{% endblock %}
+{% block content %}
+
+<h1>Settings</h1>
+
+<div class="grid grid-2">
+  <div>
+    <div class="card">
+      <h3 style="margin-top:0;">Change password</h3>
+      <form method="POST" action="{{ url_for('change_password') }}">
+        <label for="current_password">Current password</label>
+        <input type="password" id="current_password" name="current_password" required>
+        <label for="new_password">New password</label>
+        <input type="password" id="new_password" name="new_password" minlength="8" required>
+        <label for="confirm_password">Confirm new password</label>
+        <input type="password" id="confirm_password" name="confirm_password" minlength="8" required>
+        <button type="submit" class="btn btn-primary" style="margin-top:14px;">Update password</button>
+      </form>
+    </div>
+  </div>
+
+  <div>
+    <div class="card" style="margin-bottom:20px;">
+      <h3 style="margin-top:0;">Appearance</h3>
+      <div class="settings-row">
+        <div>
+          <div class="label">Theme</div>
+          <div class="desc">Light / dark is saved in this browser via the moon/sun icon in the top bar.</div>
+        </div>
+        <button class="btn btn-sm" onclick="toggleTheme()">Toggle now</button>
+      </div>
+      <div class="settings-row">
+        <div>
+          <div class="label">Reset to system default</div>
+          <div class="desc">Clears your saved preference and follows your OS setting.</div>
+        </div>
+        <button class="btn btn-sm" onclick="localStorage.removeItem('dd-theme'); location.reload();">Reset</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0;">Kali forensic bridge</h3>
+      <div class="settings-row">
+        <div>
+          <div class="label">Connection</div>
+          <div class="desc">{{ kali_url }}</div>
+        </div>
+        <span class="badge {{ 'badge-on' if kali_online else 'badge-off' }}">{{ 'Online' if kali_online else 'Offline' }}</span>
+      </div>
+      <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0;">
+        {% if kali_online %}
+          The Kali VM is reachable — file forensics, network scan and OSINT tools are available.
+        {% else %}
+          Start the Kali VM and run <code>agent.py</code> to enable forensic tool pages.
+        {% endif %}
+      </p>
+    </div>
+  </div>
+</div>
+
+{% endblock %}

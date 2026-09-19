@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Network Scan — Deepfake Defence{% endblock %}
+{% block content %}
+
+<h1>Network Scan (nmap)</h1>
+<p class="tool-desc">
+  Runs a service-detection port scan through the Kali VM. Targets are restricted
+  to loopback, your VirtualBox lab networks, and <code>scanme.nmap.org</code> —
+  Nmap's official test host. This tool requires a case with a recorded
+  authorisation before it will run.
+</p>
+
+{% if not kali_online %}
+<div class="flash flash-error">Kali VM is not reachable. Start the VM and run <code>agent.py</code>.</div>
+{% endif %}
+
+<div class="card">
+  <label>Case (required)</label>
+  <select id="case-select">
+    <option value="">— Select a case —</option>
+    {% for c in cases %}
+      <option value="{{ c._id }}" data-authorised="{{ 'yes' if c.authorisation else 'no' }}">
+        {{ c.title }} {{ '(authorised)' if c.authorisation else '(no authorisation yet)' }}
+      </option>
+    {% endfor %}
+  </select>
+  <p id="auth-warning" style="color: var(--danger); font-size: 0.85rem; display:none;">
+    This case has no authorisation recorded. Add one from the case page before scanning.
+  </p>
+
+  <label>Target</label>
+  <input type="text" id="target-input" placeholder="scanme.nmap.org, 127.0.0.1, or 192.168.56.x">
+
+  <label>Ports</label>
+  <input type="text" id="ports-input" placeholder="1-1024" value="1-1024">
+
+  <button class="btn btn-primary" id="run-btn" data-label="Run Scan" style="margin-top:16px;" {{ 'disabled' if not kali_online }} onclick="runNmap()">Run Scan</button>
+</div>
+
+<div class="card" style="margin-top:20px;">
+  <h4 style="margin-top:0;">Output</h4>
+  <pre class="result" id="result">Select a case and target, then run the scan.</pre>
+</div>
+
+{% endblock %}
+{% block scripts %}
+<script>
+const caseSelect = document.getElementById('case-select');
+caseSelect.addEventListener('change', () => {
+  const opt = caseSelect.selectedOptions[0];
+  document.getElementById('auth-warning').style.display =
+    (opt && opt.value && opt.dataset.authorised === 'no') ? 'block' : 'none';
+});
+
+function runNmap() {
+  const caseId = caseSelect.value;
+  if (!caseId) { alert('Select a case first — nmap requires an authorised case.'); return; }
+  const target = document.getElementById('target-input').value.trim();
+  const ports = document.getElementById('ports-input').value.trim() || '1-1024';
+  if (!target) { alert('Enter a target.'); return; }
+
+  ddRunJsonTool('/api/kali/network/nmap', { target, ports, case_id: caseId },
+    { button: document.getElementById('run-btn'), resultEl: document.getElementById('result') });
+}
+</script>
+{% endblock %}

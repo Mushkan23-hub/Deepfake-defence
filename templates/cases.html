@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+{% block title %}Cases — Deepfake Defence{% endblock %}
+{% block content %}
+
+<h1>Cases</h1>
+<p class="tool-desc">Group scans and Kali tool runs into an investigation case with a full audit timeline. Tools that contact third parties (nmap, sherlock, theHarvester) require an authorised case.</p>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h3 style="margin-top:0;">New case</h3>
+    <label>Title</label>
+    <input type="text" id="new-title" placeholder="e.g. Case 2026-014">
+    <label>Description</label>
+    <textarea id="new-desc" placeholder="Optional"></textarea>
+    <button class="btn btn-primary" style="margin-top:14px;" onclick="createCase()">Create case</button>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Your cases</h3>
+    <div id="case-list">Loading…</div>
+  </div>
+</div>
+
+<div class="card" id="detail-card" style="margin-top:24px; display:none;">
+  <div style="display:flex; justify-content:space-between; align-items:center;">
+    <h3 id="detail-title" style="margin:0;"></h3>
+    <div>
+      <a class="btn btn-sm" id="export-link" href="#" target="_blank">Export ZIP</a>
+      <button class="btn btn-sm btn-danger" onclick="closeCase()">Close case</button>
+    </div>
+  </div>
+  <p id="detail-desc" style="color: var(--text-muted);"></p>
+
+  <div id="auth-block"></div>
+
+  <h4>Timeline</h4>
+  <div id="timeline"></div>
+
+  <h4>Evidence</h4>
+  <div id="evidence"></div>
+
+  <h4>Scans</h4>
+  <div id="case-scans"></div>
+</div>
+
+{% endblock %}
+{% block scripts %}
+<script>
+let currentCaseId = null;
+
+async function loadCases() {
+  const res = await fetch('/api/cases');
+  const cases = await res.json();
+  const list = document.getElementById('case-list');
+  if (!cases.length) { list.innerHTML = '<p style="color:var(--text-muted);">No cases yet.</p>'; return; }
+  list.innerHTML = cases.map(c => `
+    <div style="padding:10px 0; border-bottom:1px solid var(--border); cursor:pointer;" onclick="openCase('${c._id}')">
+      <strong>${escapeHtml(c.title)}</strong>
+      <span class="badge ${c.status === 'open' ? 'badge-on' : 'badge-off'}" style="margin-left:8px;">${c.status}</span>
+      <div style="font-size:0.8rem; color:var(--text-muted);">${c.scan_count} scans · ${c.evidence_count} evidence items ${c.authorisation ? '· authorised' : '· not authorised'}</div>
+    </div>`).join('');
+}
+
+async function createCase() {
+  const title = document.getElementById('new-title').value.trim();
+  if (title.length < 3) { alert('Title must be at least 3 characters.'); return; }
+  const description = document.getElementById('new-desc').value.trim();
+  const res = await fetch('/api/cases', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ title, description })
+  });
+  const data = await res.json();
+  if (data.error) { alert(data.error); return; }
+  document.getElementById('new-title').value = '';
+  document.getElementById('new-desc').value = '';
+  loadCases();
+  openCase(data.case_id);
+}
+
+async function openCase(id) {
+  currentCaseId = id;
+  const res = await fetch(`/api/cases/${id}`);
+  const data = await res.json();
+  if (data.error) { alert(data.error); return; }
+
+  document.getElementById('detail-card').style.display = 'block';
+  document.getElementById('detail-title').textContent = data.case.title;
+  document.getElementById('detail-desc').textContent = data.case.description || '';
+  document.getElementById('export-link').href = `/api/cases/${id}/export`;
+
+  const authBlock = document.getElementById('auth-block');
+  if (data.case.authorisation) {
+    const a = data.case.authorisation;
+    authBlock.innerHTML = `<div class="flash flash-info">Authorised by <strong>${escapeHtml(a.authority)}</strong> — ref: ${escapeHtml(a.reference)}<br>Scope: ${escapeHtml(a.scope)}</div>`;
+  } else {
+    authBlock.innerHTML = `
+      <div class="flash flash-error">No authorisation recorded — external tools (nmap, sherlock, theHarvester) are blocked for this case.</div>
+      <label>Authority (who authorised this)</label>
+      <input type="text" id="auth-authority" placeholder="e.g. Course instructor, client name">
+      <label>Reference (written record)</label>
+      <input type="text" id="auth-reference" placeholder="e.g. consent form #, ticket ID">
+      <label>Scope</label>
+      <textarea id="auth-scope" placeholder="What this authorisation covers"></textarea>
+      <button class="btn btn-sm btn-primary" style="margin-top:10px;" onclick="recordAuth()">Record authorisation</button>
+    `;
+  }
+
+  document.getElementById('timeline').innerHTML = data.timeline.length
+    ? '<table><tr><th>When</th><th>Action</th><th>Detail</th></tr>' +
+      data.timeline.map(t => `<tr><td>${t.at}</td><td>${t.action}</td><td>${escapeHtml(t.detail)}</td></tr>`).join('') + '</table>'
+    : '<p style="color:var(--text-muted);">No activity yet.</p>';
+
+  document.getElementById('evidence').innerHTML = data.evidence.length
+    ? '<table><tr><th>Tool</th><th>Subject</th><th>OK</th><th>When</th></tr>' +
+      data.evidence.map(e => `<tr><td>${e.tool}</td><td>${escapeHtml(e.subject)}</td><td>${e.ok ? '✅' : '❌'}</td><td>${e.created_at}</td></tr>`).join('') + '</table>'
+    : '<p style="color:var(--text-muted);">No evidence collected yet.</p>';
+
+  document.getElementById('case-scans').innerHTML = data.scans.length
+    ? '<table><tr><th>File</th><th>Verdict</th></tr>' +
+      data.scans.map(s => `<tr><td>${escapeHtml(s.filename)}</td><td><span class="badge ${s.is_fake ? 'badge-fake' : 'badge-real'}">${s.verdict}</span></td></tr>`).join('') + '</table>'
+    : '<p style="color:var(--text-muted);">No scans linked yet.</p>';
+}
+
+async function recordAuth() {
+  const authority = document.getElementById('auth-authority').value.trim();
+  const reference = document.getElementById('auth-reference').value.trim();
+  const scope = document.getElementById('auth-scope').value.trim();
+  if (!authority || !reference || !scope) { alert('All three fields are required.'); return; }
+  const res = await fetch(`/api/cases/${currentCaseId}/authorisation`, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ authority, reference, scope })
+  });
+  const data = await res.json();
+  if (data.error) { alert(data.error); return; }
+  openCase(currentCaseId);
+  loadCases();
+}
+
+async function closeCase() {
+  if (!confirm('Close this case?')) return;
+  await fetch(`/api/cases/${currentCaseId}/close`, { method: 'POST' });
+  openCase(currentCaseId);
+  loadCases();
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str || '';
+  return div.innerHTML;
+}
+
+loadCases();
+</script>
+{% endblock %}

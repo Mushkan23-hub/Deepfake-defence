@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} — Deepfake Defence{% endblock %}
+{% block content %}
+
+<h1>{{ title }}</h1>
+<p class="tool-desc">{{ description }}</p>
+
+<div class="card">
+  <label>Optional: attach to a case</label>
+  <select id="case-select">
+    <option value="">— No case (ad-hoc scan) —</option>
+    {% for c in cases %}
+      <option value="{{ c._id }}">{{ c.title }}</option>
+    {% endfor %}
+  </select>
+
+  <label>{{ kind|capitalize }} file</label>
+  <div class="dropzone" id="dropzone">
+    <p id="dz-label">Click to choose a file, or drag one here<br><small>{{ accept_hint }}</small></p>
+    <input type="file" id="file-input" accept="{{ accept }}">
+  </div>
+
+  <button class="btn btn-primary" id="run-btn" data-label="Analyse" style="margin-top:16px;" onclick="runScan()">Analyse</button>
+</div>
+
+<div class="card" id="result-card" style="margin-top:20px; display:none;">
+  <h3 id="verdict-heading"></h3>
+  <div id="verdict-badge"></div>
+  <div class="grid grid-2" style="margin-top:16px;">
+    <div>
+      <h4>Explanation</h4>
+      <ul id="explanation-list"></ul>
+    </div>
+    <div>
+      <h4>Hashes</h4>
+      <div id="hash-block" style="font-size:0.82rem; color:var(--text-muted);"></div>
+      <h4 style="margin-top:16px;">Model status</h4>
+      <div id="model-status" style="font-size:0.82rem; color:var(--text-muted);"></div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+{% block scripts %}
+<script>
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('file-input');
+const dzLabel = document.getElementById('dz-label');
+
+dropzone.addEventListener('click', () => fileInput.click());
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
+dropzone.addEventListener('drop', e => {
+  e.preventDefault(); dropzone.classList.remove('drag');
+  if (e.dataTransfer.files.length) { fileInput.files = e.dataTransfer.files; updateLabel(); }
+});
+fileInput.addEventListener('change', updateLabel);
+function updateLabel() {
+  if (fileInput.files[0]) dzLabel.innerHTML = '📄 ' + fileInput.files[0].name;
+}
+
+async function runScan() {
+  const btn = document.getElementById('run-btn');
+  const file = fileInput.files[0];
+  if (!file) { alert('Choose a file first.'); return; }
+
+  const fd = new FormData();
+  fd.append('file', file);
+  const caseId = document.getElementById('case-select').value;
+  if (caseId) fd.append('case_id', caseId);
+
+  ddSetLoading(btn, true);
+  document.getElementById('result-card').style.display = 'none';
+  try {
+    const res = await fetch('/api/analyse/{{ kind }}', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    renderVerdict(data);
+  } catch (err) {
+    alert('Request failed: ' + err);
+  } finally {
+    ddSetLoading(btn, false);
+  }
+}
+
+function renderVerdict(data) {
+  document.getElementById('result-card').style.display = 'block';
+  const heading = document.getElementById('verdict-heading');
+  const badge = document.getElementById('verdict-badge');
+  heading.textContent = data.verdict + ' — ' + data.confidence + '% confidence';
+  badge.innerHTML = `<span class="badge ${data.is_fake ? 'badge-fake' : 'badge-real'}">${data.verdict}</span>`;
+
+  const list = document.getElementById('explanation-list');
+  list.innerHTML = '';
+  (data.explanation || []).forEach(line => {
+    const li = document.createElement('li');
+    li.textContent = line;
+    list.appendChild(li);
+  });
+
+  const hashBlock = document.getElementById('hash-block');
+  hashBlock.innerHTML = data.hashes
+    ? Object.entries(data.hashes).map(([k, v]) => `<div><strong>${k}:</strong> ${v}</div>`).join('')
+    : '(not computed)';
+
+  const modelStatus = document.getElementById('model-status');
+  modelStatus.textContent = data.model_status === 'trained'
+    ? `Trained classifier: ${data.model_source}`
+    : 'No trained classifier available — verdict is based on heuristic signals only (noise, symmetry, compression), which are unreliable. Install "transformers" and ensure internet access on first run.';
+}
+</script>
+{% endblock %}

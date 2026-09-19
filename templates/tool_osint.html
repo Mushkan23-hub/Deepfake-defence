@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} — Deepfake Defence{% endblock %}
+{% block content %}
+
+<h1>{{ title }}</h1>
+<p class="tool-desc">{{ description }}</p>
+
+{% if not kali_online %}
+<div class="flash flash-error">Kali VM is not reachable. Start the VM and run <code>agent.py</code>.</div>
+{% endif %}
+
+<div class="card">
+  <label>Case (required)</label>
+  <select id="case-select">
+    <option value="">— Select a case —</option>
+    {% for c in cases %}
+      <option value="{{ c._id }}" data-authorised="{{ 'yes' if c.authorisation else 'no' }}">
+        {{ c.title }} {{ '(authorised)' if c.authorisation else '(no authorisation yet)' }}
+      </option>
+    {% endfor %}
+  </select>
+  <p id="auth-warning" style="color: var(--danger); font-size: 0.85rem; display:none;">
+    This case has no authorisation recorded. Add one from the case page before running this tool.
+  </p>
+
+  <label>{{ input_label }}</label>
+  <input type="text" id="subject-input" placeholder="{{ input_placeholder }}">
+
+  <button class="btn btn-primary" id="run-btn" data-label="Run Search" style="margin-top:16px;" {{ 'disabled' if not kali_online }} onclick="runOsint()">Run Search</button>
+</div>
+
+<div class="card" style="margin-top:20px;">
+  <h4 style="margin-top:0;">Output</h4>
+  <pre class="result" id="result">Select a case and enter a {{ kind == 'sherlock' and 'username' or 'domain' }}, then run.</pre>
+</div>
+
+{% endblock %}
+{% block scripts %}
+<script>
+const caseSelect = document.getElementById('case-select');
+caseSelect.addEventListener('change', () => {
+  const opt = caseSelect.selectedOptions[0];
+  document.getElementById('auth-warning').style.display =
+    (opt && opt.value && opt.dataset.authorised === 'no') ? 'block' : 'none';
+});
+
+function runOsint() {
+  const caseId = caseSelect.value;
+  if (!caseId) { alert('Select a case first — this tool requires an authorised case.'); return; }
+  const subject = document.getElementById('subject-input').value.trim();
+  if (!subject) { alert('Enter a value first.'); return; }
+
+  const url = '{{ kind }}' === 'sherlock' ? '/api/kali/osint/sherlock' : '/api/kali/osint/theharvester';
+  const payload = '{{ kind }}' === 'sherlock' ? { username: subject, case_id: caseId } : { domain: subject, case_id: caseId };
+
+  ddRunJsonTool(url, payload, { button: document.getElementById('run-btn'), resultEl: document.getElementById('result') });
+}
+</script>
+{% endblock %}

@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Deepfake Defence{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v={{ asset_version('style.css') }}">
+<script>
+  // Set theme before paint to avoid a flash of the wrong theme.
+  (function(){ var t = localStorage.getItem('dd-theme'); if (t) document.documentElement.setAttribute('data-theme', t); })();
+</script>
+</head>
+<body>
+  <canvas id="cyber-bg"></canvas>
+  <div class="bg-glow"></div>
+
+  <header class="topbar">
+    <div class="topbar-left">
+      <button class="icon-btn" onclick="toggleSidebar()" title="Menu" aria-label="Toggle menu">☰</button>
+      <a href="{{ url_for('index') }}" class="brand"><span class="shield">🛡️</span> Deepfake Defence</a>
+    </div>
+    <div class="topbar-right">
+      <button class="icon-btn" onclick="toggleTheme()" title="Toggle theme">
+        <span id="theme-toggle-icon">🌙</span>
+      </button>
+      {% if session.get('user_id') %}
+        <a class="icon-btn" href="{{ url_for('settings_page') }}" title="Settings">⚙️</a>
+        <a class="user-chip" href="{{ url_for('profile_page') }}" title="My Profile">👤 {{ session.get('username') }}</a>
+        <a class="btn btn-sm" href="{{ url_for('logout') }}">Logout</a>
+      {% else %}
+        <a class="btn btn-sm" href="{{ url_for('login_page') }}">Login</a>
+        <a class="btn btn-sm btn-primary" href="{{ url_for('signup_page') }}">Sign up</a>
+      {% endif %}
+    </div>
+  </header>
+
+  <div class="sidebar-overlay" onclick="closeSidebar()"></div>
+  <nav class="sidebar">
+    <div class="sidebar-group">
+      <h4>Overview</h4>
+      <a class="sidebar-link {{ 'active' if active=='home' }}" href="{{ url_for('index') }}"><span class="dot">🏠</span> Home</a>
+      {% if session.get('user_id') %}
+      <a class="sidebar-link {{ 'active' if active=='activity' }}" href="{{ url_for('activity') }}"><span class="dot">📊</span> My Activity</a>
+      <a class="sidebar-link {{ 'active' if active=='cases' }}" href="{{ url_for('cases_page') }}"><span class="dot">🗂️</span> Cases</a>
+      <a class="sidebar-link {{ 'active' if active=='profile' }}" href="{{ url_for('profile_page') }}"><span class="dot">👤</span> My Profile</a>
+      <a class="sidebar-link {{ 'active' if active=='settings' }}" href="{{ url_for('settings_page') }}"><span class="dot">⚙️</span> Settings</a>
+      {% endif %}
+    </div>
+    <div class="sidebar-group">
+      <h4>AI Detection</h4>
+      <a class="sidebar-link {{ 'active' if active=='tool_image' }}" href="{{ url_for('tool_image') }}"><span class="dot">🖼️</span> Image Scan</a>
+      <a class="sidebar-link {{ 'active' if active=='tool_video' }}" href="{{ url_for('tool_video') }}"><span class="dot">🎞️</span> Video Scan</a>
+      <a class="sidebar-link {{ 'active' if active=='tool_audio' }}" href="{{ url_for('tool_audio') }}"><span class="dot">🎙️</span> Audio Scan</a>
+    </div>
+    <div class="sidebar-group">
+      <h4>File Forensics (Kali)</h4>
+      <a class="sidebar-link {{ 'active' if active=='steghide' }}" href="{{ url_for('tool_file_page', tool='steghide') }}"><span class="dot">🕵️</span> Steganography</a>
+      <a class="sidebar-link {{ 'active' if active=='binwalk' }}" href="{{ url_for('tool_file_page', tool='binwalk') }}"><span class="dot">🔬</span> Binary Analysis</a>
+      <a class="sidebar-link {{ 'active' if active=='binwalk_extract' }}" href="{{ url_for('tool_file_page', tool='binwalk_extract') }}"><span class="dot">📦</span> Extract Embedded Files</a>
+      <a class="sidebar-link {{ 'active' if active=='foremost' }}" href="{{ url_for('tool_file_page', tool='foremost') }}"><span class="dot">🧩</span> File Carving</a>
+      <a class="sidebar-link {{ 'active' if active=='exiftool' }}" href="{{ url_for('tool_file_page', tool='exiftool') }}"><span class="dot">🏷️</span> Metadata</a>
+      <a class="sidebar-link {{ 'active' if active=='strings' }}" href="{{ url_for('tool_file_page', tool='strings') }}"><span class="dot">🔤</span> Strings</a>
+    </div>
+    <div class="sidebar-group">
+      <h4>Network Forensics</h4>
+      <a class="sidebar-link {{ 'active' if active=='tshark_summary' }}" href="{{ url_for('tool_file_page', tool='tshark_summary') }}"><span class="dot">📡</span> PCAP Protocols</a>
+      <a class="sidebar-link {{ 'active' if active=='tshark_convs' }}" href="{{ url_for('tool_file_page', tool='tshark_convs') }}"><span class="dot">🔗</span> PCAP Conversations</a>
+      <a class="sidebar-link {{ 'active' if active=='nmap' }}" href="{{ url_for('tool_nmap') }}"><span class="dot">🌐</span> Network Scan</a>
+    </div>
+    <div class="sidebar-group">
+      <h4>OSINT</h4>
+      <a class="sidebar-link {{ 'active' if active=='sherlock' }}" href="{{ url_for('tool_osint_page', kind='sherlock') }}"><span class="dot">🔎</span> Username Search</a>
+      <a class="sidebar-link {{ 'active' if active=='theharvester' }}" href="{{ url_for('tool_osint_page', kind='theharvester') }}"><span class="dot">✉️</span> Domain Harvesting</a>
+    </div>
+  </nav>
+
+  <div class="app-shell">
+    <main class="app-main">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          {% for category, msg in messages %}
+            <div class="flash flash-{{ category }}">{{ msg }}</div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+
+      {% block content %}{% endblock %}
+
+      <footer class="site-footer">
+        Deepfake Defence — Digital Forensic Investigation Platform · Built by Mushkan · Flask, MongoDB &amp; Kali Linux
+      </footer>
+    </main>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}?v={{ asset_version('app.js') }}"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

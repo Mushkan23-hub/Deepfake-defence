@@ -72,6 +72,33 @@ def get_user_by_id(user_id):
         return None
 
 
+def update_user_profile(user_id, full_name, bio):
+    users_col.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {"full_name": full_name.strip()[:80], "bio": bio.strip()[:400]}},
+    )
+
+
+def update_username(user_id, new_username):
+    """
+    Changes the login username shown across the app (topbar, sidebar, @handle).
+    Returns (ok, error) — fails if another account already has that username.
+    """
+    new_username = new_username.strip()
+    clash = users_col.find_one({"username": new_username, "_id": {"$ne": ObjectId(user_id)}})
+    if clash:
+        return False, "That username is already taken."
+    users_col.update_one({"_id": ObjectId(user_id)}, {"$set": {"username": new_username}})
+    return True, None
+
+
+def update_user_password(user_id, new_password_hash):
+    users_col.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {"password_hash": new_password_hash}},
+    )
+
+
 # ── Scans ────────────────────────────────────────────────────────────────────
 
 def save_scan(user_id, filename, file_type, result, case_id=None):

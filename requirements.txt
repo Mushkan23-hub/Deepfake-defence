@@ -7,7 +7,7 @@ requests==2.32.3
 
 torch==2.3.1
 torchvision==0.18.1
-timm==1.0.9
+transformers==4.44.2
 Pillow==10.4.0
 opencv-python==4.10.0.84
 numpy==1.26.4

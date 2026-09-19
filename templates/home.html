@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}Deepfake Defence — Home{% endblock %}
+{% block content %}
+
+<section class="hero">
+  <h1>Deepfake Defence</h1>
+  <p class="lead">
+    A digital forensic investigation platform that combines AI-based deepfake
+    detection with real Kali Linux forensic tooling — file carving, steganography
+    detection, metadata analysis, PCAP inspection, network scanning and OSINT —
+    tied together with case management and a full chain-of-custody audit trail.
+  </p>
+  <div class="cta">
+    {% if session.get('user_id') %}
+      <a class="btn btn-primary" href="{{ url_for('tool_image') }}">Run a Scan</a>
+      <a class="btn" href="{{ url_for('cases_page') }}">Open Cases</a>
+    {% else %}
+      <a class="btn btn-primary" href="{{ url_for('signup_page') }}">Get Started</a>
+      <a class="btn" href="{{ url_for('login_page') }}">Login</a>
+    {% endif %}
+  </div>
+</section>
+
+<div class="grid feature-grid">
+  <div class="card feature-card">
+    <span class="emoji">🖼️</span>
+    <h3>AI Deepfake Detection</h3>
+    <p>Image, video and audio analysis combining a learned classifier with noise, symmetry and compression heuristics.</p>
+  </div>
+  <div class="card feature-card">
+    <span class="emoji">🕵️</span>
+    <h3>File Forensics</h3>
+    <p>Steganography detection, binary analysis, file carving and metadata extraction, run through a real Kali Linux VM.</p>
+  </div>
+  <div class="card feature-card">
+    <span class="emoji">📡</span>
+    <h3>Network Forensics</h3>
+    <p>PCAP protocol and conversation analysis, plus a gated, allowlisted network scanner for lab targets.</p>
+  </div>
+  <div class="card feature-card">
+    <span class="emoji">🔎</span>
+    <h3>OSINT</h3>
+    <p>Username and domain reconnaissance, unlocked only once a case carries a recorded authorisation.</p>
+  </div>
+  <div class="card feature-card">
+    <span class="emoji">🗂️</span>
+    <h3>Case Management</h3>
+    <p>Group scans and tool runs into cases with a full, exportable audit timeline.</p>
+  </div>
+  <div class="card feature-card">
+    <span class="emoji">🔒</span>
+    <h3>Security-first Design</h3>
+    <p>Every tool call is an argv list — never a shell string — validated on both sides of the Kali bridge.</p>
+  </div>
+</div>
+
+{% if session.get('user_id') %}
+<section style="margin-top: 34px;">
+  <h2 style="margin-bottom: 14px;">Recent Activity</h2>
+  <div class="grid grid-stats" style="margin-bottom: 18px;">
+    <div class="card stat-card"><div class="num">{{ stats.total if stats else 0 }}</div><div class="label">Total Scans</div></div>
+    <div class="card stat-card" style="border-color: var(--danger);"><div class="num">{{ stats.fake if stats else 0 }}</div><div class="label">Deepfakes Found</div></div>
+    <div class="card stat-card" style="border-color: var(--success);"><div class="num">{{ stats.real if stats else 0 }}</div><div class="label">Authentic</div></div>
+  </div>
+  <div class="card">
+    {% if recent_scans %}
+    <table>
+      <tr><th>File</th><th>Type</th><th>Verdict</th><th>Confidence</th><th>When</th></tr>
+      {% for s in recent_scans %}
+      <tr>
+        <td>{{ s.filename }}</td>
+        <td>{{ s.file_type }}</td>
+        <td><span class="badge {{ 'badge-fake' if s.is_fake else 'badge-real' }}">{{ s.verdict }}</span></td>
+        <td>{{ s.confidence }}%</td>
+        <td>{{ s.timestamp }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    <div style="margin-top:14px;"><a class="btn btn-sm" href="{{ url_for('activity') }}">View full activity →</a></div>
+    {% else %}
+    <p style="color: var(--text-muted);">No scans yet. Run your first analysis from the sidebar.</p>
+    {% endif %}
+  </div>
+</section>
+{% endif %}
+
+<section class="card" style="margin-top: 34px;">
+  <h3 style="margin-top:0;">About this project</h3>
+  <p style="color: var(--text-muted); line-height:1.6;">
+    Deepfake Defence started as an AI deepfake classifier and grew into a full
+    investigation platform: the Flask/MongoDB web app you're using now bridges
+    to a Kali Linux VM over an authenticated HTTP API, so every forensic tool
+    call is validated, logged, and tied to a case with an audit trail.
+  </p>
+  <p style="color: var(--text-muted); margin-bottom:0;">Built by Mushkan.</p>
+</section>
+
+{% endblock %}
