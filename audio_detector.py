@@ -1,13 +1,93 @@
 """
 audio_detector.py — Audio deepfake detection
-Layer 1: Voice clone detection (MFCC, pitch, jitter, shimmer)
-Layer 2: Audio edit/splice detection (noise floor, phase, pitch smoothness)
+
+Primary signal: a real, pretrained voice-spoof classifier
+(MelodyMachine/Deepfake-audio-detection-V2 on Hugging Face — wav2vec2-base
+fine-tuned for real-vs-synthetic speech, apache-2.0, self-reports 99.7% eval
+accuracy: https://huggingface.co/MelodyMachine/Deepfake-audio-detection-V2).
+
+Worth being skeptical of that number: it's measured on held-out data from the
+*same* training distribution, which tends to run high and doesn't guarantee
+it generalises to voice-cloning tools it never saw in training. Treat it as
+"a real trained model, meaningfully better than hand-tuned thresholds" rather
+than "99.7% accurate on anything you throw at it".
+
+Secondary signal (used always, and as the sole signal if the model can't be
+loaded): hand-built heuristics on MFCC variance, jitter, spectral flatness
+etc. These are unvalidated proxies, not a trained detector — see
+`model_status` in the returned dict.
+
+Layer 1: Voice clone detection (MFCC, pitch, jitter, shimmer) — heuristic
+Layer 2: Audio edit/splice detection (noise floor, phase, pitch smoothness) — heuristic
 """
 
+import os
 import numpy as np
 import librosa
 from scipy.stats import kurtosis, skew
-import os
+import torch
+
+try:
+    from transformers import AutoProcessor, AutoModelForAudioClassification
+    _TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    _TRANSFORMERS_AVAILABLE = False
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+HF_AUDIO_MODEL_ID = os.getenv("DEEPFAKE_AUDIO_HF_MODEL", "MelodyMachine/Deepfake-audio-detection-V2")
+
+MODEL_TRAINED = False
+MODEL_LOAD_ERROR = None
+_processor = None
+_model = None
+
+
+def load_audio_model():
+    """Downloads and caches the HF model on first call. Never raises."""
+    global _processor, _model, MODEL_TRAINED, MODEL_LOAD_ERROR
+
+    if _model is not None or MODEL_LOAD_ERROR:
+        return
+
+    if not _TRANSFORMERS_AVAILABLE:
+        MODEL_LOAD_ERROR = "transformers is not installed"
+        print(f"[audio_detector] {MODEL_LOAD_ERROR} — run: pip install transformers\n"
+              "[audio_detector] Falling back to heuristics only.")
+        return
+
+    try:
+        _processor = AutoProcessor.from_pretrained(HF_AUDIO_MODEL_ID)
+        _model = AutoModelForAudioClassification.from_pretrained(HF_AUDIO_MODEL_ID).to(DEVICE)
+        _model.eval()
+        MODEL_TRAINED = True
+        print(f"[audio_detector] loaded pretrained classifier: {HF_AUDIO_MODEL_ID}")
+    except Exception as exc:
+        MODEL_LOAD_ERROR = str(exc)
+        print(f"[audio_detector] could not load {HF_AUDIO_MODEL_ID}: {exc}\n"
+              "[audio_detector] Falling back to heuristics only. If this is "
+              "the first run, check internet access — the model downloads "
+              "from huggingface.co.")
+
+
+def _fake_probability(filepath):
+    """
+    Runs the HF model at its expected 16kHz mono sample rate. Reads the
+    model's own id2label mapping rather than assuming index order.
+    """
+    if _model is None:
+        return None
+    y, _ = librosa.load(filepath, sr=16000, mono=True)
+    inputs = _processor(y, sampling_rate=16000, return_tensors="pt")
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+    with torch.no_grad():
+        logits = _model(**inputs).logits
+        probs = torch.softmax(logits, dim=-1)[0]
+
+    id2label = {int(k): str(v).lower() for k, v in _model.config.id2label.items()}
+    fake_idx = next((i for i, lbl in id2label.items() if "fake" in lbl or "spoof" in lbl), None)
+    if fake_idx is None:
+        return None
+    return float(probs[fake_idx].item())
 
 
 def load_audio(filepath, sr=22050):
@@ -146,28 +226,50 @@ def detect_audio_edits(y, sr):
 
 
 def predict_audio(filepath: str) -> dict:
+    load_audio_model()
+
     y, sr    = load_audio(filepath)
     duration = float(len(y) / sr)
 
-    features               = extract_voice_features(y, sr)
-    clone_score, clone_flags = score_voice_clone(features, duration)
+    features                  = extract_voice_features(y, sr)
+    clone_score, clone_flags  = score_voice_clone(features, duration)
     edit_score, edit_flags, edit_points = detect_audio_edits(y, sr)
+    heuristic = round(clone_score * 0.55 + edit_score * 0.45, 4)
 
-    fused   = round(clone_score * 0.55 + edit_score * 0.45, 4)
-    is_fake = fused > 0.45
+    fake_prob = None
+    try:
+        fake_prob = _fake_probability(filepath)
+    except Exception as exc:
+        print(f"[audio_detector] model inference failed, using heuristics only: {exc}")
+
+    if fake_prob is not None:
+        # Trained classifier does most of the work; heuristics add a smaller
+        # amount of independent, explainable signal alongside it.
+        fused = fake_prob * 0.85 + heuristic * 0.15
+        model_status = "trained"
+        lead_note = ["🔎 Verdict is led by a trained voice-spoof classifier; "
+                     "the signals below are supporting heuristic detail."]
+    else:
+        fused = heuristic
+        model_status = "untrained-baseline"
+        lead_note = []
+    fused   = round(float(np.clip(fused, 0, 1)), 4)
+    is_fake = fused > 0.5
     conf    = round(fused * 100 if is_fake else (1 - fused) * 100, 1)
 
     return {
-        "verdict":     "DEEPFAKE" if is_fake else "REAL",
-        "confidence":  conf,
-        "is_fake":     is_fake,
-        "raw_score":   fused,
+        "verdict":      "DEEPFAKE" if is_fake else "REAL",
+        "confidence":   conf,
+        "is_fake":      is_fake,
+        "raw_score":    fused,
+        "model_status": model_status,
+        "model_source": HF_AUDIO_MODEL_ID if model_status == "trained" else None,
         "scores": {
+            "model":       round(fake_prob, 4) if fake_prob is not None else None,
             "voice_clone": clone_score,
             "audio_edit":  edit_score,
-            "fused":       fused,
         },
-        "explanation": clone_flags + edit_flags,
+        "explanation": lead_note + clone_flags + edit_flags,
         "forensics": {
             "audio": {
                 "duration_seconds": round(duration, 2),

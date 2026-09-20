@@ -496,7 +496,7 @@ def analyse_audio():
         result = predict_audio(path)
         if "error" in result:
             return jsonify(result), 400
-        result["forensics"] = {"exiftool": run_exiftool(path)}
+        result["forensics"] = {**result.get("forensics", {}), "exiftool": run_exiftool(path)}
         result["stored_name"] = stored
         result["hashes"] = kali_client.compute_hashes(path, stored).get("hashes", {})
         result["scan_id"] = db.save_scan(session["user_id"],

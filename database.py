@@ -15,6 +15,7 @@ from pymongo import MongoClient, ASCENDING, DESCENDING
 from bson.objectid import ObjectId
 from datetime import datetime, timedelta, timezone
 import os
+import numpy as np
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -31,6 +32,32 @@ audit_col    = db["audit"]
 
 def _now():
     return datetime.now(timezone.utc)
+
+
+def _sanitize(value):
+    """
+    Recursively converts numpy scalar types to native Python types.
+
+    Model inference (torch/numpy/opencv code) commonly hands back
+    numpy.bool_, numpy.float64, numpy.int64 etc. instead of plain bool/float/
+    int. BSON — MongoDB's storage format — doesn't know how to encode those
+    and raises "cannot encode object ..., of type: <class 'numpy.bool_'>" (or
+    the float/int equivalent) the moment one appears anywhere in a document,
+    however deeply nested. Every document built from a detector's result goes
+    through this before insert_one, so the fix is permanent regardless of
+    which detector code produced the values.
+    """
+    if isinstance(value, dict):
+        return {k: _sanitize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize(v) for v in value]
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    return value
 
 
 def ensure_indexes():
@@ -116,7 +143,7 @@ def save_scan(user_id, filename, file_type, result, case_id=None):
         "hashes":      result.get("hashes", {}),
         "timestamp":   _now(),
     }
-    scan_id = str(scans_col.insert_one(doc).inserted_id)
+    scan_id = str(scans_col.insert_one(_sanitize(doc)).inserted_id)
     if case_id:
         log_action(case_id, user_id, "scan.created",
                    f"{file_type} scan of {filename} -> {doc['verdict']}",
@@ -249,7 +276,7 @@ def save_evidence(case_id, user_id, tool, subject, result):
         "error": result.get("error"),
         "created_at": _now(),
     }
-    ev_id = str(evidence_col.insert_one(doc).inserted_id)
+    ev_id = str(evidence_col.insert_one(_sanitize(doc)).inserted_id)
     log_action(case_id, user_id, "evidence.collected",
                f"{tool} run against {subject}", {"evidence_id": ev_id})
     return ev_id

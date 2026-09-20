@@ -1,34 +1,74 @@
 """
-detector.py — Deepfake Defence core engine (v3)
+detector.py — Deepfake Defence core engine
 
-Uses an ensemble of THREE independent signals:
+Primary signal: an average across one or more real, pretrained deepfake
+image classifiers from Hugging Face. Currently:
 
-1. Hugging Face ViT classifier (ashish-001/deepfake-detection-using-ViT)
-   — good at face-swap style fakes
+  - buildborderless/CommunityForensics-DeepfakeDet-ViT
+    ViT-Small trained on 2.7M images across 4,803 different generators.
+    From a peer-reviewed paper: "Community Forensics: Using Thousands of
+    Generators to Train Fake Image Detectors" (Park & Owens, University of
+    Michigan, CVPR 2025 — arXiv:2411.04125). MIT licensed. By far the
+    largest and most diverse training set of the models used here.
+    https://huggingface.co/buildborderless/CommunityForensics-DeepfakeDet-ViT
 
-2. Frequency domain analysis (FFT-based)
-   — catches GAN/diffusion generated images which have unnatural
-   frequency fingerprints. Real cameras have natural frequency noise.
-   AI generators are too "clean" in high frequencies.
+  - dima806/deepfake_vs_real_image_detection
+    ViT-Base fine-tuned on a face-swap dataset. apache-2.0. Self-reports
+    99.27% accuracy on its own eval set (76k images).
+    https://huggingface.co/dima806/deepfake_vs_real_image_detection
 
-3. Heuristic signals
-   — noise pattern, facial asymmetry, compression artifacts
+A note on how the first one was verified: its Hugging Face page currently
+contains a section that reads like a prompt injection aimed at AI coding
+agents specifically (naming Claude Code / Cursor / Copilot, pointing them at
+an "AGENTS.md", and asserting a `transformers >= 5.4.0` requirement that does
+not correspond to any real release). That block was ignored entirely — no
+extra files were fetched from that repo, no dependency versions were changed
+on its say-so, and no custom/remote code from it is used. What WAS verified
+independently: the paper exists (arXiv:2411.04125), is CVPR 2025, and the
+model card's plain "Quick Start" section (a completely ordinary sigmoid
+single-logit classifier, unremarkable on its own) is consistent with normal
+`transformers` usage on the version already pinned in requirements.txt.
 
-WHY THIS IS BETTER:
-- Old: model × 0.85 + heuristics × 0.15  → model dominates, wrong results
-- New: calibrated ensemble with per-signal confidence weighting
-       + dynamic threshold that adjusts based on signal agreement
-       + separate handling for "all signals agree" vs "signals conflict"
+Caveats worth being upfront about, not papering over:
+  - Both accuracy figures are self-reported on each model's own held-out
+    data from the SAME distribution it trained on — that tends to read high
+    and is not a guarantee of accuracy on a generator neither one saw.
+  - dima806's own model card explicitly warns it is ~3 years old and that
+    modern generators (Flux, Midjourney, DALL-E 3, Stable Diffusion 3) cause
+    "significant concept drift" — a fully AI-generated image from a newer
+    generator can plausibly still read as REAL to this class of model. The
+    Community Forensics model's much larger, more diverse generator coverage
+    is specifically meant to reduce (not eliminate) this failure mode.
+  - Deliberately NOT using prithivMLmods/Deep-Fake-Detector-v2-Model: there
+    is an open, unresolved report on that model's own discussion page
+    ("Label mappings are inverted in the HF pipeline") — using it risked
+    silently flipping every verdict.
 
-Threshold logic:
-  - All 3 signals say fake  → verdict = DEEPFAKE, high confidence
-  - 2 of 3 signals say fake → verdict = DEEPFAKE, medium confidence
-  - 1 of 3 signals say fake → verdict = REAL, low confidence
-  - 0 of 3 signals say fake → verdict = REAL, high confidence
-  This prevents one bad signal from dominating.
+Combination method: a plain average of each loaded model's P(fake), no
+invented weighting or calibration constants — there's no labeled validation
+set of our own to justify anything fancier than that. Add or remove models
+via the DEEPFAKE_HF_MODELS env var (comma-separated).
+
+Each model's own config is read at runtime rather than assuming a fixed
+output format or label index — checkpoints differ (single-logit sigmoid vs
+multi-class softmax, and which index means "fake" when it is softmax), and
+guessing wrong silently inverts or misreads every result.
+
+If none of the models can be loaded (transformers not installed, no internet
+on first run, cache permission errors), predict_image returns an "error"
+result instead of a verdict. The noise / symmetry / compression heuristics are
+NOT evidence of manipulation (they score most ordinary photos as "fake-ish"),
+so they are reported for information only and never used to decide a verdict.
 """
 
 import os
+
+# Keep the Hugging Face cache somewhere this user account can write. Must run
+# BEFORE transformers / huggingface_hub are imported (they read it at import).
+# setdefault: a HF_HOME already set in the shell still wins.
+os.environ.setdefault("HF_HOME", os.path.join(os.path.dirname(os.path.abspath(__file__)), "hf_cache"))
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
 import cv2
 import numpy as np
 from PIL import Image
@@ -40,330 +80,232 @@ try:
 except ImportError:
     _TRANSFORMERS_AVAILABLE = False
 
-# ── Config ────────────────────────────────────────────────────────────────────
-DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-HF_MODEL_ID = os.getenv("DEEPFAKE_HF_MODEL", "ashish-001/deepfake-detection-using-ViT")
+# ── Constants ────────────────────────────────────────────────────────────────
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+HF_MODEL_IDS = [
+    m.strip() for m in os.getenv(
+        "DEEPFAKE_HF_MODELS",
+        "buildborderless/CommunityForensics-DeepfakeDet-ViT,"
+        "dima806/deepfake_vs_real_image_detection",
+    ).split(",") if m.strip()
+]
 
-MODEL_TRAINED   = False
-MODEL_LOAD_ERROR = None
-_processor = None
-_model     = None
+REAL_THRESHOLD = 0.35   # P(fake) at or below this -> REAL
+FAKE_THRESHOLD = 0.65   # P(fake) at or above this -> DEEPFAKE; in between -> INCONCLUSIVE
+
+# model_id -> {"processor", "model", "loaded", "error"}
+_states = {}
 
 
-# ── Model loading ─────────────────────────────────────────────────────────────
 def load_model():
-    global _processor, _model, MODEL_TRAINED, MODEL_LOAD_ERROR
-    if _model is not None or MODEL_LOAD_ERROR:
-        return
+    """
+    Downloads and caches each configured Hugging Face model on first call
+    (needs internet the first time; cached under ~/.cache/huggingface after
+    that). A model that fails to load is skipped, not fatal — never raises.
+    """
     if not _TRANSFORMERS_AVAILABLE:
-        MODEL_LOAD_ERROR = "transformers not installed"
+        for model_id in HF_MODEL_IDS:
+            state = _states.setdefault(model_id, {})
+            if not state.get("error"):
+                state["error"] = "transformers is not installed"
+        print("[detector] transformers is not installed — run: pip install transformers\n"
+              "[detector] Falling back to heuristics only.")
         return
-    try:
-        _processor = AutoImageProcessor.from_pretrained(HF_MODEL_ID)
-        _model     = AutoModelForImageClassification.from_pretrained(HF_MODEL_ID).to(DEVICE)
-        _model.eval()
-        MODEL_TRAINED = True
-        print(f"[detector] loaded: {HF_MODEL_ID}")
-    except Exception as exc:
-        MODEL_LOAD_ERROR = str(exc)
-        print(f"[detector] model load failed: {exc} — using heuristics only")
+
+    for model_id in HF_MODEL_IDS:
+        state = _states.setdefault(model_id, {"processor": None, "model": None,
+                                              "loaded": False, "error": None})
+        if state["loaded"] or state["error"]:
+            continue
+        try:
+            state["processor"] = AutoImageProcessor.from_pretrained(model_id)
+            m = AutoModelForImageClassification.from_pretrained(model_id).to(DEVICE)
+            m.eval()
+            state["model"] = m
+            state["loaded"] = True
+            print(f"[detector] loaded pretrained classifier: {model_id} "
+                  f"(labels: {dict(m.config.id2label)})")
+        except Exception as exc:
+            state["error"] = str(exc)
+            print(f"[detector] could not load {model_id}: {exc}\n"
+                  "[detector] If this is the first run, check internet access "
+                  "— models download from huggingface.co.")
 
 
-def _vit_fake_probability(pil_image: Image.Image):
+def _is_fake_label(label: str) -> bool:
+    """True if a class label means "AI-generated / manipulated" (checkpoints name it differently)."""
+    label = label.strip().lower()
+    if label in ("ai", "ai-generated", "ai_generated", "ai generated"):
+        return True
+    return any(w in label for w in ("fake", "artificial", "generated", "synthetic"))
+
+
+def _fake_probability_for(model_id, pil_image: Image.Image):
     """
-    Returns raw P(fake) from ViT model 0-1, or None if unavailable.
-    
-    CALIBRATION FIX: The raw model output is miscalibrated — it's too
-    aggressive. We apply a correction to pull extreme values toward center:
-    - raw 0.9 (very confident fake) → calibrated 0.75
-    - raw 0.6 (slightly fake) → calibrated 0.52  
-    - raw 0.5 (uncertain) → calibrated 0.50
-    This prevents the model from being too dominant in the ensemble.
+    Runs one loaded model and returns P(fake) in [0, 1], or None if it isn't
+    loaded or its output format is unrecognised.
+
+    Handles two conventions, detected from the model's own config rather than
+    assumed for any specific checkpoint:
+      - single-logit sigmoid heads (config.num_labels == 1) — one probability,
+        by the near-universal convention that a higher value means "fake"
+      - multi-class softmax heads — reads id2label rather than assuming index
+        order, since that varies by checkpoint
     """
-    if _model is None:
+    state = _states.get(model_id)
+    if not state or not state.get("loaded"):
         return None
-
-    inputs = _processor(
-        images=pil_image.convert("RGB"),
-        return_tensors="pt"
-    ).to(DEVICE)
-
+    inputs = state["processor"](images=pil_image.convert("RGB"), return_tensors="pt").to(DEVICE)
     with torch.no_grad():
-        logits = _model(**inputs).logits
-        probs  = torch.softmax(logits, dim=-1)[0]
+        logits = state["model"](**inputs).logits
 
-    id2label = {int(k): str(v).lower() for k, v in _model.config.id2label.items()}
-    fake_idx = next((i for i, lbl in id2label.items() if "fake" in lbl), None)
+    num_labels = getattr(state["model"].config, "num_labels", logits.shape[-1])
+    if num_labels == 1:
+        return float(torch.sigmoid(logits)[0][0].item())
+
+    probs = torch.softmax(logits, dim=-1)[0]
+    id2label = {int(k): str(v).lower() for k, v in state["model"].config.id2label.items()}
+    fake_idx = next((i for i, lbl in id2label.items() if _is_fake_label(lbl)), None)
     if fake_idx is None:
-        return None
-
-    raw = float(probs[fake_idx].item())
-
-    # Calibration: apply temperature scaling to soften overconfident predictions
-    # Temperature > 1 makes distribution softer (less extreme)
-    temperature = 1.8
-    logit_fake = np.log(raw + 1e-8) / temperature
-    logit_real = np.log((1 - raw) + 1e-8) / temperature
-    calibrated = float(np.exp(logit_fake) / (np.exp(logit_fake) + np.exp(logit_real)))
-
-    return round(calibrated, 4)
+        return None  # Unrecognised label scheme — don't guess which index means what.
+    return float(probs[fake_idx].item())
 
 
-# ── Signal 2: Frequency Domain Analysis ──────────────────────────────────────
-def analyse_frequency_domain(img_np):
-    """
-    FFT-based analysis to detect AI-generated images.
-    
-    WHY IT WORKS:
-    Real camera photos have natural high-frequency noise from the sensor,
-    lens, and JPEG compression. AI generators (GANs, diffusion models) 
-    produce images that are "too clean" — they suppress natural noise and
-    create periodic artifacts in the frequency domain.
-    
-    We look for:
-    1. Unusually low high-frequency energy (too clean = suspicious)
-    2. Periodic peaks in FFT (GAN fingerprints)
-    3. Abnormal ratio between low and high frequency energy
-    
-    Returns score 0-1 where higher = more likely AI generated.
-    """
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
-
-    # Apply FFT
-    fft        = np.fft.fft2(gray)
-    fft_shift  = np.fft.fftshift(fft)
-    magnitude  = np.log(np.abs(fft_shift) + 1)
-
-    h, w       = magnitude.shape
-    cy, cx     = h // 2, w // 2
-
-    # Low frequency region (center) — general structure
-    low_r      = min(h, w) // 8
-    Y, X       = np.ogrid[:h, :w]
-    low_mask   = (Y - cy)**2 + (X - cx)**2 <= low_r**2
-    high_mask  = ~low_mask
-
-    low_energy  = magnitude[low_mask].mean()
-    high_energy = magnitude[high_mask].mean()
-
-    # Ratio: real images have more balanced energy distribution
-    # AI images: very high low/high ratio (too clean in high frequencies)
-    ratio = low_energy / (high_energy + 1e-8)
-
-    # Normal ratio for real photos: roughly 1.5 - 3.0
-    # AI generated: often > 3.5 or shows periodic patterns
-    if ratio > 4.0:
-        freq_score = min(1.0, (ratio - 4.0) / 4.0 + 0.6)
-    elif ratio > 3.0:
-        freq_score = 0.3 + (ratio - 3.0) * 0.3
-    elif ratio < 1.2:
-        # Very low ratio = too much high freq noise = also suspicious
-        freq_score = 0.35
-    else:
-        freq_score = max(0.0, (ratio - 1.5) / 3.0)
-
-    # Also check for periodic GAN fingerprints (regular peaks in FFT)
-    # Normalize magnitude and look for outlier peaks
-    norm_mag    = (magnitude - magnitude.min()) / (magnitude.max() - magnitude.min() + 1e-8)
-    high_region = norm_mag[high_mask]
-    peak_ratio  = (high_region > 0.85).mean()  # fraction of high-freq that are peaks
-
-    if peak_ratio > 0.02:  # more than 2% are peaks = GAN fingerprint
-        freq_score = min(1.0, freq_score + 0.25)
-
-    return round(float(freq_score), 4)
-
-
-# ── Signal 3: Heuristics ──────────────────────────────────────────────────────
+# ── Heuristic helpers (used for explanation layer) ────────────────────────────
 def analyse_noise(img_np):
-    """
-    Laplacian variance — measures image sharpness/noise level.
-    GANs often produce unnaturally smooth images (low variance)
-    or unnaturally sharp edges (very high variance).
-    """
-    gray      = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    """High-frequency noise analysis — GAN images often show unnatural noise patterns."""
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
     laplacian = cv2.Laplacian(gray, cv2.CV_32F)
-    variance  = laplacian.var()
-
-    # Very low variance = too smooth = suspicious
-    # Very high variance = unnatural sharpness = suspicious
-    # Normal range for real photos: roughly 200-1500
-    if variance < 50:
-        score = 0.75   # too smooth
-    elif variance < 150:
-        score = 0.45
-    elif variance > 2500:
-        score = 0.55   # unnaturally sharp
-    else:
-        score = max(0.0, 1 - (variance / 2000))
-
-    return round(float(score), 3)
-
-
-def analyse_face_consistency(img_np):
-    """
-    Left/right facial symmetry check.
-    Real faces have natural minor asymmetry.
-    Face-swapped deepfakes often have unnatural asymmetry at blend boundaries.
-    """
-    gray  = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-    h, w  = gray.shape
-    left  = gray[:, :w//2]
-    right = cv2.flip(gray[:, w//2:], 1)
-    min_w = min(left.shape[1], right.shape[1])
-    diff  = np.abs(left[:, :min_w].astype(float) - right[:, :min_w].astype(float))
-    asymmetry = diff.mean() / 255.0
-
-    # Natural human face asymmetry: 0.05 - 0.15
-    # Too symmetric (< 0.03) or too asymmetric (> 0.25) both suspicious
-    if asymmetry < 0.03:
-        score = 0.5   # unnaturally symmetric
-    elif asymmetry > 0.25:
-        score = 0.65  # unnatural asymmetry (blend boundary)
-    else:
-        score = float(np.clip((asymmetry - 0.05) * 4, 0, 0.4))
-
-    return round(float(score), 3)
-
-
-def analyse_compression_artifacts(img_np):
-    """
-    DCT-based compression analysis.
-    Deepfakes that went through multiple encode/decode cycles show
-    inconsistent JPEG compression patterns.
-    """
-    img_yuv   = cv2.cvtColor(img_np, cv2.COLOR_RGB2YUV)
-    y_channel = img_yuv[:, :, 0].astype(np.float32)
-    dct       = cv2.dct(y_channel[:256, :256])
-    high_freq = np.abs(dct[64:, 64:]).mean()
-    score     = float(np.clip(high_freq / 50, 0, 1))
+    variance = laplacian.var()
+    # Real photos: moderate variance. GANs: very low or very high.
+    score = float(np.clip(1 - (variance / 2000), 0, 1))
     return round(score, 3)
 
 
-# ── Ensemble logic ────────────────────────────────────────────────────────────
-def _ensemble(vit_score, freq_score, heuristic_score):
-    """
-    Combines three independent signals using voting + weighted average.
-    
-    VOTING: Each signal votes FAKE if its score > its own threshold.
-    The threshold is different per signal because they have different scales.
-    
-    WEIGHTING: Weighted average, but weights adjust based on vote agreement.
-    When signals agree → increase confidence.
-    When signals disagree → reduce confidence (be conservative).
-    """
-    # Each signal votes with its own calibrated threshold
-    vit_votes        = vit_score is not None and vit_score > 0.52
-    freq_votes       = freq_score > 0.45
-    heuristic_votes  = heuristic_score > 0.42
-
-    votes = sum([vit_votes, freq_votes, heuristic_votes])
-    available = 3 if vit_score is not None else 2
-
-    # Weighted average — ViT gets more weight when available
-    if vit_score is not None:
-        weighted = vit_score * 0.50 + freq_score * 0.30 + heuristic_score * 0.20
-    else:
-        weighted = freq_score * 0.55 + heuristic_score * 0.45
-
-    # Agreement bonus/penalty
-    if votes == available:
-        # All agree = boost confidence in the direction they agree
-        fused = weighted * 1.10
-        agreement = "all_agree"
-    elif votes == 0:
-        # All say real = boost confidence toward real
-        fused = weighted * 0.90
-        agreement = "all_agree"
-    elif votes >= available // 2 + 1:
-        # Majority say fake
-        fused = weighted
-        agreement = "majority"
-    else:
-        # Majority say real — be conservative, reduce fake score
-        fused = weighted * 0.85
-        agreement = "majority"
-
-    fused = float(np.clip(fused, 0, 1))
-
-    # Final decision threshold — slightly above 0.5 to reduce false positives
-    is_fake = fused > 0.52
-
-    return fused, is_fake, votes, available, agreement
+def analyse_face_consistency(img_np):
+    """Check facial landmark symmetry — deepfakes often have subtle asymmetries."""
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    left  = gray[:, :w//2]
+    right = cv2.flip(gray[:, w//2:], 1)
+    min_w = min(left.shape[1], right.shape[1])
+    diff = np.abs(left[:, :min_w].astype(float) - right[:, :min_w].astype(float))
+    asymmetry = diff.mean() / 255.0
+    score = float(np.clip(asymmetry * 4, 0, 1))
+    return round(score, 3)
 
 
-# ── Explanation builder ───────────────────────────────────────────────────────
-def build_explanation(fused, vit_s, freq_s, noise_s, face_s, compress_s,
-                      is_fake, votes, available, agreement):
+def analyse_compression_artifacts(img_np):
+    """JPEG compression artifact analysis — deepfakes often show inconsistent artifacts."""
+    img_yuv = cv2.cvtColor(img_np, cv2.COLOR_RGB2YUV)
+    y_channel = img_yuv[:, :, 0].astype(np.float32)
+    dct = cv2.dct(y_channel[:256, :256])
+    high_freq = np.abs(dct[64:, 64:]).mean()
+    score = float(np.clip(high_freq / 50, 0, 1))
+    return round(score, 3)
+
+
+def build_explanation(confidence, noise_s, face_s, compress_s, is_fake):
+    """Generate a human-readable explanation of the detection result."""
     reasons = []
 
     if is_fake:
-        reasons.append(f"🔴 {votes}/{available} detection signals flagged this as manipulated.")
-        if vit_s is not None and vit_s > 0.52:
-            reasons.append("🔴 ViT classifier detected visual features associated with face-swap deepfakes.")
-        if freq_s > 0.45:
-            reasons.append("🔴 Frequency domain analysis: abnormal FFT pattern — consistent with AI-generated imagery.")
         if noise_s > 0.5:
-            reasons.append("🔴 Unnatural noise pattern — image may be too smooth or too sharp for a real photo.")
+            reasons.append("🔴 Unnatural noise patterns detected — consistent with GAN-generated imagery.")
         if face_s > 0.4:
-            reasons.append("🔴 Facial asymmetry outside natural human range — possible face-swap boundary.")
+            reasons.append("🔴 Facial asymmetry above normal threshold — possible face-swap artefact.")
         if compress_s > 0.5:
-            reasons.append("🔴 Inconsistent compression artifacts — signs of multiple encode/decode cycles.")
-        if agreement == "all_agree":
-            reasons.append("🔴 All detection methods agree — high reliability verdict.")
+            reasons.append("🔴 Inconsistent compression artefacts — common in synthetically generated faces.")
+        if confidence > 0.85:
+            reasons.append("🔴 High model confidence: strong visual features associated with deepfakes.")
+        if not reasons:
+            reasons.append("🔴 Model detected subtle manipulations not easily visible to the human eye.")
     else:
-        reasons.append(f"🟢 {available - votes}/{available} detection signals classify this as authentic.")
-        if freq_s < 0.35:
-            reasons.append("🟢 Natural frequency spectrum — consistent with real camera sensor output.")
         if noise_s < 0.3:
-            reasons.append("🟢 Natural noise distribution — no signs of AI smoothing.")
-        if face_s < 0.25:
-            reasons.append("🟢 Facial symmetry within normal human range.")
-        if agreement == "all_agree":
-            reasons.append("🟢 All detection methods agree — high reliability verdict.")
-        if not reasons[1:]:
-            reasons.append("🟢 No significant manipulation indicators detected across all analysis methods.")
+            reasons.append("🟢 Natural noise distribution — consistent with real camera sensor output.")
+        if face_s < 0.3:
+            reasons.append("🟢 Facial symmetry within natural human range.")
+        if compress_s < 0.3:
+            reasons.append("🟢 Compression patterns consistent with authentic photographic media.")
+        if confidence < 0.2:
+            reasons.append("🟢 High model confidence: strong features associated with authentic content.")
+        if not reasons:
+            reasons.append("🟢 No significant manipulation indicators detected.")
 
     return reasons
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 def predict_image(pil_image: Image.Image) -> dict:
+    """
+    Run deepfake detection on a PIL image.
+    Returns dict with verdict, confidence, scores, and explanation.
+    """
     load_model()
     img_np = np.array(pil_image.convert("RGB"))
 
-    # Run all three signals
-    vit_score       = _vit_fake_probability(pil_image)
-    freq_score      = analyse_frequency_domain(img_np)
-    noise_s         = analyse_noise(img_np)
-    face_s          = analyse_face_consistency(img_np)
-    compress_s      = analyse_compression_artifacts(img_np)
-    heuristic_score = noise_s * 0.40 + face_s * 0.35 + compress_s * 0.25
+    model_probs = {}
+    for model_id in HF_MODEL_IDS:
+        try:
+            p = _fake_probability_for(model_id, pil_image)
+        except Exception as exc:
+            print(f"[detector] inference failed for {model_id}, skipping it: {exc}")
+            p = None
+        if p is not None:
+            model_probs[model_id] = p
 
-    # Ensemble
-    fused, is_fake, votes, available, agreement = _ensemble(
-        vit_score, freq_score, heuristic_score
-    )
+    if not model_probs:
+        # No classifier ran. Refuse to guess rather than invent a verdict.
+        return {
+            "error": "No detection model is loaded, so no verdict can be given.",
+            "model_status": "unavailable",
+            "model_errors": {k: v.get("error") for k, v in _states.items() if v.get("error")},
+        }
 
-    confidence_pct = round(fused * 100 if is_fake else (1 - fused) * 100, 1)
+    # Heuristics: informational only, NOT part of the verdict (see docstring).
+    noise_s    = analyse_noise(img_np)
+    face_s     = analyse_face_consistency(img_np)
+    compress_s = analyse_compression_artifacts(img_np)
 
-    explanation = build_explanation(
-        fused, vit_score, freq_score, noise_s, face_s, compress_s,
-        is_fake, votes, available, agreement
-    )
+    # Plain average across whichever models loaded — no invented weights.
+    model_avg = sum(model_probs.values()) / len(model_probs)
+    fused = float(np.clip(model_avg, 0, 1))
+
+    # Three-way verdict. The 0.35 / 0.65 cut-offs are a starting point, not
+    # calibrated values — tune them on images you have labelled yourself.
+    if fused >= FAKE_THRESHOLD:
+        verdict, is_fake = "DEEPFAKE", True
+        confidence_pct = round(fused * 100, 1)
+    elif fused <= REAL_THRESHOLD:
+        verdict, is_fake = "REAL", False
+        confidence_pct = round((1 - fused) * 100, 1)
+    else:
+        verdict, is_fake = "INCONCLUSIVE", False
+        confidence_pct = round(max(fused, 1 - fused) * 100, 1)
+
+    if verdict == "INCONCLUSIVE":
+        explanation = ["🟡 The classifier(s) are not confident either way — treat this as unverified, not as real or fake."]
+    elif is_fake:
+        explanation = [f"🔴 Classifier average P(fake) = {fused:.0%}."]
+    else:
+        explanation = [f"🟢 Classifier average P(fake) = {fused:.0%}."]
+
+    if len(model_probs) > 1:
+        votes = ", ".join(f"{k.split('/')[-1]}: {v:.0%}" for k, v in model_probs.items())
+        explanation.append(f"🔎 Per-model P(fake) — {votes}.")
+        if (max(model_probs.values()) > 0.5) != (min(model_probs.values()) > 0.5):
+            explanation.append("⚠️ The models disagree with each other on this image.")
 
     return {
-        "verdict":      "DEEPFAKE" if is_fake else "REAL",
-        "confidence":   confidence_pct,
-        "raw_score":    round(fused, 4),
-        "is_fake":      is_fake,
-        "model_status": "trained" if vit_score is not None else "heuristics-only",
-        "model_source": HF_MODEL_ID if vit_score is not None else None,
-        "signal_votes": f"{votes}/{available}",
-        "agreement":    agreement,
+        "verdict":     verdict,
+        "confidence":  confidence_pct,
+        "raw_score":   round(fused, 4),
+        "is_fake":     is_fake,
+        "model_status": "trained",
+        "model_source": ", ".join(model_probs.keys()),
         "scores": {
-            "model":       round(vit_score, 4) if vit_score is not None else None,
-            "frequency":   freq_score,
+            "model":       round(model_avg, 4),
+            "per_model":   {k: round(v, 4) for k, v in model_probs.items()},
             "noise":       noise_s,
             "face":        face_s,
             "compression": compress_s,
@@ -373,6 +315,10 @@ def predict_image(pil_image: Image.Image) -> dict:
 
 
 def predict_video(video_path: str, sample_every: int = 15) -> dict:
+    """
+    Analyse a video file by sampling frames.
+    Returns aggregate verdict with per-frame breakdown.
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {"error": "Could not open video file."}
@@ -390,9 +336,12 @@ def predict_video(video_path: str, sample_every: int = 15) -> dict:
         if not ret:
             break
         if frame_idx % sample_every == 0:
-            rgb       = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil       = Image.fromarray(rgb)
-            res       = predict_image(pil)
+            rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil   = Image.fromarray(rgb)
+            res   = predict_image(pil)
+            if "error" in res:
+                cap.release()
+                return {"error": res["error"]}
             timestamp = round(frame_idx / fps, 2)
             frame_results.append({
                 "frame":      frame_idx,
@@ -410,22 +359,25 @@ def predict_video(video_path: str, sample_every: int = 15) -> dict:
     if not frame_results:
         return {"error": "No frames could be analysed."}
 
-    analysed   = len(frame_results)
-    fake_ratio = fake_count / analysed
-    avg_score  = round(sum(r["raw_score"] for r in frame_results) / analysed, 4)
-    is_fake    = fake_ratio > 0.45
-    confidence = round((fake_ratio if is_fake else 1 - fake_ratio) * 100, 1)
+    analysed     = len(frame_results)
+    fake_ratio   = fake_count / analysed
+    avg_score    = round(sum(r["raw_score"] for r in frame_results) / analysed, 4)
+    is_fake      = fake_ratio > 0.4
+    confidence   = round((fake_ratio if is_fake else 1 - fake_ratio) * 100, 1)
+
+    # Highlight suspicious segments
     suspicious = [r for r in frame_results if r["verdict"] == "DEEPFAKE"]
 
     explanation = []
     if is_fake:
         explanation.append(f"🔴 {fake_count} of {analysed} sampled frames flagged as deepfake ({round(fake_ratio*100)}%).")
         if suspicious:
-            explanation.append(f"🔴 Manipulation first detected at {suspicious[0]['timestamp']}s.")
+            first_ts = suspicious[0]["timestamp"]
+            explanation.append(f"🔴 Manipulation first detected at {first_ts}s into the video.")
         explanation.append("🔴 Inconsistent facial features across frames — hallmark of face-swap deepfakes.")
     else:
         explanation.append(f"🟢 {analysed - fake_count} of {analysed} sampled frames classified as authentic.")
-        explanation.append("🟢 No significant temporal inconsistencies detected.")
+        explanation.append("🟢 No significant temporal inconsistencies detected across frames.")
 
     return {
         "verdict":       "DEEPFAKE" if is_fake else "REAL",

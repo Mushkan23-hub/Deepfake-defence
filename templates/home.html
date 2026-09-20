@@ -4,7 +4,8 @@
 
 <section class="hero">
   <h1>Deepfake Defence</h1>
-  <p class="lead">
+  <p class="lead" id="typewriter-target"></p>
+  <p class="lead sr-fallback" hidden>
     A digital forensic investigation platform that combines AI-based deepfake
     detection with real Kali Linux forensic tooling — file carving, steganography
     detection, metadata analysis, PCAP inspection, network scanning and OSINT —
@@ -22,36 +23,36 @@
 </section>
 
 <div class="grid feature-grid">
-  <div class="card feature-card">
+  <a class="card feature-card" href="{{ url_for('tool_image') }}">
     <span class="emoji">🖼️</span>
     <h3>AI Deepfake Detection</h3>
     <p>Image, video and audio analysis combining a learned classifier with noise, symmetry and compression heuristics.</p>
-  </div>
-  <div class="card feature-card">
+  </a>
+  <a class="card feature-card" href="{{ url_for('tool_file_page', tool='steghide') }}">
     <span class="emoji">🕵️</span>
     <h3>File Forensics</h3>
     <p>Steganography detection, binary analysis, file carving and metadata extraction, run through a real Kali Linux VM.</p>
-  </div>
-  <div class="card feature-card">
+  </a>
+  <a class="card feature-card" href="{{ url_for('tool_nmap') }}">
     <span class="emoji">📡</span>
     <h3>Network Forensics</h3>
     <p>PCAP protocol and conversation analysis, plus a gated, allowlisted network scanner for lab targets.</p>
-  </div>
-  <div class="card feature-card">
+  </a>
+  <a class="card feature-card" href="{{ url_for('tool_osint_page', kind='sherlock') }}">
     <span class="emoji">🔎</span>
     <h3>OSINT</h3>
     <p>Username and domain reconnaissance, unlocked only once a case carries a recorded authorisation.</p>
-  </div>
-  <div class="card feature-card">
+  </a>
+  <a class="card feature-card" href="{{ url_for('cases_page') }}">
     <span class="emoji">🗂️</span>
     <h3>Case Management</h3>
     <p>Group scans and tool runs into cases with a full, exportable audit timeline.</p>
-  </div>
-  <div class="card feature-card">
+  </a>
+  <a class="card feature-card" href="{{ url_for('cases_page') }}">
     <span class="emoji">🔒</span>
     <h3>Security-first Design</h3>
     <p>Every tool call is an argv list — never a shell string — validated on both sides of the Kali bridge.</p>
-  </div>
+  </a>
 </div>
 
 {% if session.get('user_id') %}

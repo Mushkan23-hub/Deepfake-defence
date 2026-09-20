@@ -104,9 +104,15 @@ function renderVerdict(data) {
     : '(not computed)';
 
   const modelStatus = document.getElementById('model-status');
-  modelStatus.textContent = data.model_status === 'trained'
-    ? `Trained classifier: ${data.model_source}`
-    : 'No trained classifier available — verdict is based on heuristic signals only (noise, symmetry, compression), which are unreliable. Install "transformers" and ensure internet access on first run.';
+  if (data.model_status === 'trained') {
+    const perModel = (data.scores && data.scores.per_model) || {};
+    const rows = Object.entries(perModel)
+      .map(([id, p]) => `<div>${id}: ${(p * 100).toFixed(1)}% fake</div>`)
+      .join('');
+    modelStatus.innerHTML = `<div>Trained classifier${Object.keys(perModel).length > 1 ? 's' : ''} used:</div>${rows}`;
+  } else {
+    modelStatus.textContent = 'No trained classifier available — verdict is based on heuristic signals only (noise, symmetry, compression), which are unreliable. Install "transformers" and ensure internet access on first run.';
+  }
 }
 </script>
 {% endblock %}
