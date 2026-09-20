@@ -123,21 +123,12 @@ def load_model():
             m.eval()
             state["model"] = m
             state["loaded"] = True
-            print(f"[detector] loaded pretrained classifier: {model_id} "
-                  f"(labels: {dict(m.config.id2label)})")
+            print(f"[detector] loaded pretrained classifier: {model_id}")
         except Exception as exc:
             state["error"] = str(exc)
             print(f"[detector] could not load {model_id}: {exc}\n"
                   "[detector] If this is the first run, check internet access "
                   "— models download from huggingface.co.")
-
-
-def _is_fake_label(label: str) -> bool:
-    """True if a class label means "AI-generated / manipulated" (checkpoints name it differently)."""
-    label = label.strip().lower()
-    if label in ("ai", "ai-generated", "ai_generated", "ai generated"):
-        return True
-    return any(w in label for w in ("fake", "artificial", "generated", "synthetic"))
 
 
 def _fake_probability_for(model_id, pil_image: Image.Image):
@@ -165,7 +156,7 @@ def _fake_probability_for(model_id, pil_image: Image.Image):
 
     probs = torch.softmax(logits, dim=-1)[0]
     id2label = {int(k): str(v).lower() for k, v in state["model"].config.id2label.items()}
-    fake_idx = next((i for i, lbl in id2label.items() if _is_fake_label(lbl)), None)
+    fake_idx = next((i for i, lbl in id2label.items() if "fake" in lbl), None)
     if fake_idx is None:
         return None  # Unrecognised label scheme — don't guess which index means what.
     return float(probs[fake_idx].item())
